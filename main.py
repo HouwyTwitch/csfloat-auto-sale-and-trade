@@ -82,10 +82,19 @@ async def amain(config_path: Path, cookie_path: Path) -> None:
                 post_run_delay=float(cfg.get("post_run_delay_seconds", 5)),
             )
 
-            try:
-                await poller.run()
-            except KeyboardInterrupt:
-                logging.getLogger(__name__).info("Interrupted by user — shutting down.")
+            await poller.run()
+
+
+def _resolve_path(raw: str) -> Path:
+    """
+    Resolve a path argument.  Absolute paths are used as-is;
+    relative paths are resolved against the script's directory
+    (not CWD) so the tool works when invoked from elsewhere.
+    """
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    return Path(__file__).resolve().parent / p
 
 
 def main() -> None:
@@ -95,12 +104,12 @@ def main() -> None:
     parser.add_argument(
         "--config",
         default="config.json",
-        help="Path to config JSON file (default: config.json)",
+        help="Path to config JSON file (default: config.json next to this script)",
     )
     parser.add_argument(
         "--cookies",
         default="cookies.json",
-        help="Path to Steam session cookies file (default: cookies.json)",
+        help="Path to Steam session cookies file (default: cookies.json next to this script)",
     )
     parser.add_argument(
         "--log-level",
@@ -114,7 +123,7 @@ def main() -> None:
     log = logging.getLogger(__name__)
 
     try:
-        asyncio.run(amain(Path(args.config), Path(args.cookies)))
+        asyncio.run(amain(_resolve_path(args.config), _resolve_path(args.cookies)))
     except cfg_module.ConfigError as exc:
         log.error("Configuration error: %s", exc)
         sys.exit(1)

@@ -1,0 +1,27 @@
+# Secrets — never commit these
+config.json
+cookies.json
+steam.json
+*.maFile
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# State files
+processed_trades.json

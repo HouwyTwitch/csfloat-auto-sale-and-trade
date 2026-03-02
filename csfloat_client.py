@@ -79,7 +79,10 @@ class CSFloatClient:
     ) -> Any:
         """Execute an HTTP request with exponential-backoff retry."""
         delay = self._retry_delay
-        for attempt in range(1, self._retry_max + 2):
+        error_attempts = 0
+        rate_limit_attempts = 0
+        max_rate_limit = 10  # separate budget so 429s don't eat error retries
+        while True:
             try:
                 async with self._session.request(
                     method,
@@ -90,8 +93,14 @@ class CSFloatClient:
                 ) as resp:
                     text = await resp.text()
                     if resp.status == 429:
+                        rate_limit_attempts += 1
+                        if rate_limit_attempts > max_rate_limit:
+                            raise CSFloatAPIError(resp.status, text)
                         retry_after = float(resp.headers.get("Retry-After", delay))
-                        log.warning("Rate-limited by CSFloat; sleeping %.1fs", retry_after)
+                        log.warning(
+                            "Rate-limited by CSFloat (%d/%d); sleeping %.1fs",
+                            rate_limit_attempts, max_rate_limit, retry_after,
+                        )
                         await asyncio.sleep(retry_after)
                         continue
                     if not resp.ok:
@@ -103,14 +112,15 @@ class CSFloatClient:
             except CSFloatAPIError:
                 raise  # propagate immediately — caller decides
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                if attempt > self._retry_max:
-                    log.error("Giving up on %s after %d attempts: %s", label or url, attempt, exc)
+                error_attempts += 1
+                if error_attempts > self._retry_max:
+                    log.error("Giving up on %s after %d attempts: %s", label or url, error_attempts, exc)
                     raise
                 log.warning(
                     "Transient error on %s (attempt %d/%d): %s — retrying in %.1fs",
                     label or url,
-                    attempt,
-                    self._retry_max + 1,
+                    error_attempts,
+                    self._retry_max,
                     exc,
                     delay,
                 )

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -226,9 +228,10 @@ class TradeProcessor:
         confirmed = await self._st.confirm_offer(offer_id)
         if not confirmed:
             log.warning(
-                "Offer %s sent but confirmation failed — will retry on next cycle.",
+                "Offer %s individual confirm failed — trying broad confirmation sweep.",
                 offer_id,
             )
+            await self._st.confirm_all_pending()
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +282,8 @@ class NotificationPoller:
         self._notif_interval = notif_interval
         self._heartbeat_interval = heartbeat_interval
         self._post_run_delay = post_run_delay
-        self._seen_notif_ids: set[Any] = set()
+        # OrderedDict preserves insertion order so we can evict oldest entries
+        self._seen_notif_ids: OrderedDict[Any, None] = OrderedDict()
         self._last_heartbeat: float = 0.0
 
     async def run(self) -> None:
@@ -287,8 +291,6 @@ class NotificationPoller:
         Run forever, driving the trade processor as fast as notifications allow.
         Press Ctrl+C to stop.
         """
-        import time
-
         log.info(
             "Notification poller started — notif_interval=%.0fs, heartbeat=%.0fs",
             self._notif_interval,
@@ -312,12 +314,14 @@ class NotificationPoller:
                     if n.get("id") not in self._seen_notif_ids
                     and self._is_trade_notif(n)
                 ]
-                # Mark all as seen
+                # Mark all as seen (OrderedDict preserves insertion order)
                 for n in notifs:
-                    self._seen_notif_ids.add(n.get("id"))
-                # Trim the seen set to avoid unbounded growth
-                if len(self._seen_notif_ids) > 2000:
-                    self._seen_notif_ids = set(list(self._seen_notif_ids)[-1000:])
+                    nid = n.get("id")
+                    if nid not in self._seen_notif_ids:
+                        self._seen_notif_ids[nid] = None
+                # Evict oldest entries to bound memory (FIFO)
+                while len(self._seen_notif_ids) > 2000:
+                    self._seen_notif_ids.popitem(last=False)
 
                 if new_trade_notifs:
                     log.info(
@@ -376,21 +380,24 @@ class NotificationPoller:
 
 def _build_offer_plans(accepted_trades: list[dict]) -> list[OfferPlan]:
     """
-    Group accepted trades by (buyer_id, market_hash_name) so that multiple
-    sales of the same item to the same buyer go into one Steam offer.
+    Group accepted trades by buyer_id so that all items sold to the same
+    buyer go into a single Steam trade offer.
     """
-    groups: dict[tuple, OfferPlan] = {}
+    groups: dict[int, OfferPlan] = {}
     for trade in accepted_trades:
         buyer_id = int(trade["buyer_id"])
         seller_id = int(trade["seller_id"])
         item = trade.get("contract", {}).get("item", {})
-        mhn = item.get("market_hash_name", "")
-        asset_id = int(item.get("asset_id", 0))
+        raw_asset_id = item.get("asset_id")
         trade_id = int(trade["id"])
 
-        key = (buyer_id, mhn)
-        if key not in groups:
-            groups[key] = OfferPlan(
+        if not raw_asset_id:
+            log.warning("Trade %s has no asset_id in contract — skipping", trade_id)
+            continue
+        asset_id = int(raw_asset_id)
+
+        if buyer_id not in groups:
+            groups[buyer_id] = OfferPlan(
                 csfloat_trade_id=trade_id,
                 buyer_id=buyer_id,
                 seller_id=seller_id,
@@ -400,8 +407,8 @@ def _build_offer_plans(accepted_trades: list[dict]) -> list[OfferPlan]:
                 csfloat_trade_ids=[trade_id],
             )
         else:
-            groups[key].asset_ids.append(asset_id)
-            groups[key].csfloat_trade_ids.append(trade_id)
+            groups[buyer_id].asset_ids.append(asset_id)
+            groups[buyer_id].csfloat_trade_ids.append(trade_id)
 
     return list(groups.values())
 

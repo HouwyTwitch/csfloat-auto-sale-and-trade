@@ -19,7 +19,6 @@ from typing import TYPE_CHECKING
 
 import aiohttp
 from aiosteampy import SteamClient, AppContext
-from aiosteampy.constants import TradeOfferStatus
 from aiosteampy.helpers import restore_from_cookies
 from aiosteampy.mixins.guard import SteamGuardMixin
 from aiosteampy.mixins.web_api import SteamWebApiMixin
@@ -175,7 +174,12 @@ class SteamTrader:
             return None
         if len(items_to_give) != len(asset_ids):
             missing = set(asset_ids) - {i.asset_id for i in items_to_give}
-            log.warning("Some asset_ids not in inventory: %s — sending with available items", missing)
+            log.error(
+                "Cannot send partial trade — missing asset_ids: %s. "
+                "Aborting offer to avoid CSFloat verification failure.",
+                missing,
+            )
+            return None
 
         log.info(
             "Sending trade offer to %s with %d item(s)…",
@@ -303,7 +307,3 @@ def _find_items(inventory: list, asset_ids: list[int]) -> list:
     return found
 
 
-def _normalize_steam_id(raw: int) -> int:
-    """Strip the SteamID64 base offset if present to get account ID."""
-    base = 76561197960265728
-    return raw - base if raw > base else raw
