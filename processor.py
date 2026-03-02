@@ -25,7 +25,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any
 
-from steampy.models import TradeOfferState
+from aiosteampy import TradeOfferStatus
 
 from csfloat_client import CSFloatClient
 from steam_trader import SteamTrader
@@ -184,7 +184,7 @@ class TradeProcessor:
         already_sent_id = _find_existing_offer(plan, existing_offers)
         if already_sent_id is not None:
             offer = next((o for o in existing_offers if o.trade_offer_id == already_sent_id), None)
-            if offer and offer.status == TradeOfferState.ConfirmationNeed:
+            if offer and offer.status == TradeOfferStatus.CONFIRMATION_NEED:
                 log.info(
                     "Offer %s already sent but needs confirmation — confirming now.",
                     already_sent_id,
@@ -423,9 +423,9 @@ def _find_existing_offer(plan: OfferPlan, sent_offers: list) -> int | None:
 
     for offer in sent_offers:
         if offer.status not in (
-            TradeOfferState.Active,
-            TradeOfferState.ConfirmationNeed,
-            TradeOfferState.Accepted,
+            TradeOfferStatus.ACTIVE,
+            TradeOfferStatus.CONFIRMATION_NEED,
+            TradeOfferStatus.ACCEPTED,
         ):
             continue
 

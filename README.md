@@ -36,7 +36,7 @@ cd csfloat-auto-sale-and-trade
 pip install -r requirements.txt
 ```
 
-> **Note:** `steampy` is installed directly from [crab713/steampy](https://github.com/crab713/steampy) via pip's git support. Make sure `git` is available in your PATH.
+> **Note:** `protobuf` is required for aiosteampy's Steam authentication flow and is listed in `requirements.txt`.
 
 ## Configuration
 
@@ -86,4 +86,4 @@ config.example.json
 ## Credits
 
 Inspired by [CSFloat-Auto-Trade-Patched](https://github.com/redlfox/CSFloat-Auto-Trade-Patched).
-Uses [crab713/steampy](https://github.com/crab713/steampy) for Steam interaction.
+Uses [aiosteampy](https://github.com/somespecialone/aiosteampy) for Steam interaction.

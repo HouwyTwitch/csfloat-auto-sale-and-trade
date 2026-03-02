@@ -1,3 +1,4 @@
 aiohttp>=3.9.0
 aiohttp-socks>=0.8.4
-steampy @ git+https://github.com/crab713/steampy.git
+aiosteampy>=0.7.20
+protobuf>=4.0.0
