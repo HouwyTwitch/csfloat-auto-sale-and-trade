@@ -1,0 +1,24 @@
+{
+    "_comment": "Copy this file to config.json and fill in your credentials.",
+
+    "csfloat_api_key": "YOUR_CSFLOAT_API_KEY",
+
+    "steam_id64": 76561198000000000,
+    "steam_login": "your_steam_username",
+    "steam_password": "your_steam_password",
+    "shared_secret": "BASE64_SHARED_SECRET_FROM_MAFILE",
+    "identity_secret": "BASE64_IDENTITY_SECRET_FROM_MAFILE",
+
+    "_comment_optional": "Everything below is optional.",
+
+    "steam_api_key": "",
+
+    "client_proxy": "",
+    "steam_use_proxy": false,
+
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+
+    "notif_interval_seconds": 15,
+    "heartbeat_interval_seconds": 60,
+    "post_run_delay_seconds": 5
+}
