@@ -43,10 +43,13 @@ class CSFloatClient:
     Thin async wrapper around the CSFloat REST API.
 
     Args:
-        api_key:     CSFloat API key (from your profile → Developer tab).
-        session:     An *already-created* aiohttp.ClientSession to reuse.
-        retry_max:   Maximum number of retry attempts for transient errors.
-        retry_delay: Base delay (seconds) between retries (doubles each time).
+        api_key:        CSFloat API key (from your profile → Developer tab).
+        session:        An *already-created* aiohttp.ClientSession to reuse.
+        retry_max:      Maximum number of retry attempts for transient errors.
+        retry_delay:    Base delay (seconds) between retries (doubles each time).
+        trace_requests: When True (or when DEBUG logging is active), log full
+                        request URLs/bodies and response bodies.  Useful for
+                        debugging API issues — logs appear at DEBUG level.
     """
 
     def __init__(
@@ -55,11 +58,13 @@ class CSFloatClient:
         session: aiohttp.ClientSession,
         retry_max: int = 6,
         retry_delay: float = 2.0,
+        trace_requests: bool = False,
     ) -> None:
         self._key = api_key
         self._session = session
         self._retry_max = retry_max
         self._retry_delay = retry_delay
+        self._trace = trace_requests
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -78,11 +83,18 @@ class CSFloatClient:
         label: str = "",
     ) -> Any:
         """Execute an HTTP request with exponential-backoff retry."""
+        _trace = self._trace or log.isEnabledFor(logging.DEBUG)
         delay = self._retry_delay
         error_attempts = 0
         rate_limit_attempts = 0
         max_rate_limit = 10  # separate budget so 429s don't eat error retries
         while True:
+            if _trace:
+                log.debug(
+                    "CSFloat → %s %s  params=%s  body=%s",
+                    method, url, params,
+                    _redact(json) if json is not None else None,
+                )
             try:
                 async with self._session.request(
                     method,
@@ -92,6 +104,12 @@ class CSFloatClient:
                     params=params,
                 ) as resp:
                     text = await resp.text()
+                    if _trace:
+                        log.debug(
+                            "CSFloat ← %s %s  [%d]  body=%s",
+                            method, url, resp.status,
+                            text[:2000] if len(text) > 2000 else text,
+                        )
                     if resp.status == 429:
                         rate_limit_attempts += 1
                         if rate_limit_attempts > max_rate_limit:
@@ -228,3 +246,17 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).lower() in ("yes", "true", "t", "1", "y")
+
+
+def _redact(obj: Any, _sensitive: frozenset = frozenset({
+    "api_key", "authorization", "password", "token", "secret",
+})) -> Any:
+    """Return a copy of *obj* with sensitive keys replaced by '***'."""
+    if isinstance(obj, dict):
+        return {
+            k: "***" if k.lower() in _sensitive else _redact(v)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, list):
+        return [_redact(v) for v in obj]
+    return obj

@@ -253,11 +253,20 @@ class SteamTrader:
             log.info("Trade offer %s confirmed", offer_id)
             return True
         except Exception as exc:
-            # If the offer was already confirmed there is no pending confirmation
-            # to find — treat that as a success rather than an error.
+            # If the offer was already confirmed (make_trade_offer used confirm=True)
+            # there is no pending confirmation to find — treat that as success.
             msg = str(exc).lower()
-            if any(kw in msg for kw in ("not found", "no confirmation", "404", "empty")):
-                log.debug("Offer %s already confirmed (no pending confirmation): %s", offer_id, exc)
+            if any(kw in msg for kw in (
+                "not found",
+                "no confirmation",
+                "unable to find",
+                "404",
+                "empty",
+            )):
+                log.debug(
+                    "Offer %s already confirmed (no pending confirmation found): %s",
+                    offer_id, exc,
+                )
                 return True
             log.error("Failed to confirm trade offer %s: %s", offer_id, exc)
             return False
