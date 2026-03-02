@@ -64,16 +64,10 @@ class SteamTrader:
     def __init__(
         self,
         client: SteamClient,
-        username: str,
-        password: str,
-        steam_guard_json: str,
         steam_id: int,
         cookie_path: Path,
     ) -> None:
         self._client = client
-        self._username = username
-        self._password = password
-        self._steam_guard_json = steam_guard_json
         self._steam_id = steam_id
         self._cookie_path = cookie_path
 
@@ -97,12 +91,15 @@ class SteamTrader:
             p = cfg["client_proxy"]
             proxies = {"http": p, "https": p}
 
-        client = SteamClient(api_key, proxies=proxies)
-        return cls(
-            client=client,
+        client = SteamClient(
+            api_key,
             username=cfg["steam_login"],
             password=cfg["steam_password"],
-            steam_guard_json=steam_guard_json,
+            steam_guard=steam_guard_json,
+            proxies=proxies,
+        )
+        return cls(
+            client=client,
             steam_id=int(cfg["steam_id64"]),
             cookie_path=cookie_path,
         )
@@ -145,12 +142,10 @@ class SteamTrader:
                 log.warning("Could not restore cookies (%s) — doing fresh login", exc)
 
         await _with_retry(
-            lambda: self._client.login(
-                self._username, self._password, self._steam_guard_json
-            ),
+            self._client.login,
             label="steam_login",
         )
-        log.info("Logged in to Steam as %s", self._username)
+        log.info("Logged in to Steam")
 
     # ------------------------------------------------------------------
     # Inventory
