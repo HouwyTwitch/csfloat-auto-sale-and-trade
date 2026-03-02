@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from base64 import b64encode
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -21,8 +22,18 @@ import aiohttp
 from aiosteampy import SteamClient, AppContext
 from aiosteampy.helpers import restore_from_cookies
 from aiosteampy.mixins.guard import SteamGuardMixin
+from aiosteampy.mixins.login import REFERER_HEADER, API_HEADERS
 from aiosteampy.mixins.web_api import SteamWebApiMixin
 from aiosteampy.utils import get_jsonable_cookies
+from aiosteampy.exceptions import LoginError
+from aiosteampy.constants import STEAM_URL
+
+try:
+    from aiosteampy import auth_pb2 as _auth_pb2
+    from rsa import encrypt as _rsa_encrypt
+    _PROTOBUF_OK = True
+except ImportError:
+    _PROTOBUF_OK = False
 
 if TYPE_CHECKING:
     from aiosteampy.models import TradeOffer
@@ -34,11 +45,130 @@ _CS2_CTX = AppContext.CS2
 
 
 # ---------------------------------------------------------------------------
-# Extended Steam client (adds Guard + WebAPI mixins)
+# Extended Steam client (adds Guard + WebAPI mixins + login bugfix)
 # ---------------------------------------------------------------------------
 
+# Headers matching a real browser request to Steam's auth API.
+# The library only sends Referer; missing Origin causes 400 on some endpoints.
+_AUTH_HEADERS = {
+    **API_HEADERS,
+    **REFERER_HEADER,
+    "Origin": str(STEAM_URL.COMMUNITY),
+}
+
+
+def _multipart(encoded: str) -> aiohttp.FormData:
+    """Wrap a base64-encoded protobuf string in multipart/form-data.
+
+    Steam's IAuthenticationService endpoints require multipart/form-data,
+    NOT application/x-www-form-urlencoded (which aiohttp uses for plain dicts).
+    The library sends plain dicts → Steam returns 400 Bad Request.
+    """
+    form = aiohttp.FormData()
+    form.add_field("input_protobuf_encoded", encoded)
+    return form
+
+
 class _SteamClient(SteamClient, SteamWebApiMixin, SteamGuardMixin):
-    pass
+    """
+    Extended SteamClient that fixes the library's login encoding bug.
+
+    aiosteampy sends `BeginAuthSessionViaCredentials` and `PollAuthSessionStatus`
+    as `application/x-www-form-urlencoded` (plain dict → aiohttp default).
+    Steam changed these endpoints to require `multipart/form-data`.
+    We override both methods to use `aiohttp.FormData` and add the missing
+    `Origin` header.
+    """
+
+    async def _begin_auth_session_with_credentials(self) -> dict:
+        if not _PROTOBUF_OK:
+            raise LoginError(
+                "protobuf package is required. Run: pip install protobuf"
+            )
+
+        pub_key, ts = await self._get_rsa_key()
+
+        device = _auth_pb2.CAuthentication_BeginAuthSessionViaCredentials_Request.DeviceDetails()
+        device.device_friendly_name = self.user_agent or "Unknown"
+        device.platform_type = _auth_pb2.k_EAuthTokenPlatformType_WebBrowser
+
+        req = _auth_pb2.CAuthentication_BeginAuthSessionViaCredentials_Request()
+        req.account_name = self.username
+        req.encrypted_password = b64encode(
+            _rsa_encrypt(self._password.encode(), pub_key)
+        ).decode()
+        req.encryption_timestamp = ts
+        req.remember_login = 1
+        req.persistence = 1
+        req.website_id = "Community"
+        req.device_details.CopyFrom(device)
+        req.additional_field = 8
+
+        encoded = b64encode(req.SerializeToString()).decode()
+
+        # FIX: multipart/form-data instead of x-www-form-urlencoded
+        r = await self.session.post(
+            STEAM_URL.API.IAuthService.BeginAuthSessionViaCredentials,
+            data=_multipart(encoded),
+            headers=_AUTH_HEADERS,
+        )
+
+        if r.status != 200:
+            body = await r.text()
+            raise LoginError(f"BeginAuthSession failed {r.status}: {body}")
+
+        ct = r.content_type
+        if ct == "application/json":
+            return await r.json()
+        if ct in ("application/x-protobuf", "application/octet-stream"):
+            resp = _auth_pb2.CAuthentication_BeginAuthSessionViaCredentials_Response()
+            resp.ParseFromString(await r.read())
+            return {
+                "response": {
+                    "client_id": resp.client_id,
+                    "request_id": resp.request_id,   # bytes
+                    "steamid": str(resp.steamid),
+                }
+            }
+        raise LoginError(f"Unexpected content-type from BeginAuthSession: {ct}")
+
+    async def _poll_auth_session_status(
+        self, client_id: int | str, request_id: bytes | str
+    ) -> tuple[str, str]:
+        if not _PROTOBUF_OK:
+            raise LoginError(
+                "protobuf package is required. Run: pip install protobuf"
+            )
+
+        poll = _auth_pb2.CAuthentication_PollAuthSessionStatus_Request()
+        poll.client_id = int(client_id)   # must be int; JSON response may give str
+        poll.request_id = request_id if isinstance(request_id, bytes) else request_id.encode()
+
+        encoded = b64encode(poll.SerializeToString()).decode()
+
+        # FIX: multipart/form-data instead of x-www-form-urlencoded
+        r = await self.session.post(
+            STEAM_URL.API.IAuthService.PollAuthSessionStatus,
+            data=_multipart(encoded),
+            headers=_AUTH_HEADERS,
+        )
+
+        if r.status != 200:
+            body = await r.text()
+            raise LoginError(f"PollAuthSessionStatus failed {r.status}: {body}")
+
+        ct = r.content_type
+        if ct == "application/json":
+            rj = await r.json()
+            resp = rj.get("response", {})
+            if resp.get("had_remote_interaction"):
+                raise LoginError("PollAuthSessionStatus: had_remote_interaction", rj)
+            return resp["access_token"], resp["refresh_token"]
+        if ct in ("application/x-protobuf", "application/octet-stream"):
+            resp_pb = _auth_pb2.CAuthentication_PollAuthSessionStatus_Response()
+            resp_pb.ParseFromString(await r.read())
+            return resp_pb.access_token, resp_pb.refresh_token
+        raise LoginError(f"Unexpected content-type from PollAuthSessionStatus: {ct}")
 
 
 # ---------------------------------------------------------------------------
