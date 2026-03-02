@@ -10,6 +10,7 @@ Automatically processes CSFloat sales:
 
 Usage:
     python main.py [--config config.json] [--cookies cookies.json]
+                   [--log-level DEBUG] [--log-file app.log] [--trace-http]
 
 Requirements:
     pip install -r requirements.txt
@@ -20,6 +21,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import logging.handlers
+import signal
 import sys
 from pathlib import Path
 
@@ -35,19 +38,53 @@ from steam_trader import SteamTrader
 # Logging setup
 # ---------------------------------------------------------------------------
 
-def _setup_logging(level: str = "INFO") -> None:
+def _setup_logging(
+    level: str = "INFO",
+    log_file: str | None = None,
+    trace_http: bool = False,
+) -> None:
     fmt = "%(asctime)s  %(levelname)-8s  %(name)s — %(message)s"
-    logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), format=fmt)
-    # Quiet down noisy third-party loggers
-    for name in ("aiohttp", "asyncio", "steampy", "urllib3"):
-        logging.getLogger(name).setLevel(logging.WARNING)
+    formatter = logging.Formatter(fmt)
+
+    root = logging.getLogger()
+    root.setLevel(getattr(logging, level.upper(), logging.INFO))
+
+    # Console handler
+    console = logging.StreamHandler(sys.stdout)
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    # Optional rotating file handler
+    if log_file:
+        fh = logging.handlers.RotatingFileHandler(
+            log_file,
+            maxBytes=10 * 1024 * 1024,  # 10 MB
+            backupCount=5,
+            encoding="utf-8",
+        )
+        fh.setFormatter(formatter)
+        root.addHandler(fh)
+        logging.getLogger(__name__).info("Logging to file: %s (10 MB × 5 rotation)", log_file)
+
+    # Quiet down noisy third-party loggers (unless DEBUG requested)
+    if level.upper() != "DEBUG":
+        for name in ("aiohttp", "asyncio", "steampy", "urllib3"):
+            logging.getLogger(name).setLevel(logging.WARNING)
+
+    if trace_http:
+        logging.getLogger("csfloat_client").setLevel(logging.DEBUG)
+        logging.getLogger(__name__).info("HTTP trace logging enabled for CSFloat requests")
 
 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
-async def amain(config_path: Path, cookie_path: Path) -> None:
+async def amain(
+    config_path: Path,
+    cookie_path: Path,
+    trace_http: bool = False,
+) -> None:
     cfg = cfg_module.load(config_path)
 
     # Build aiohttp session (with optional proxy for CSFloat requests)
@@ -65,6 +102,7 @@ async def amain(config_path: Path, cookie_path: Path) -> None:
         csfloat = CSFloatClient(
             api_key=cfg["csfloat_api_key"],
             session=http_session,
+            trace_requests=trace_http,
         )
 
         async with SteamTrader.from_config(cfg, cookie_path) as steam:
@@ -117,13 +155,38 @@ def main() -> None:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging verbosity (default: INFO)",
     )
+    parser.add_argument(
+        "--log-file",
+        default=None,
+        metavar="PATH",
+        help="Write logs to this file in addition to stdout (rotated at 10 MB, 5 backups kept)",
+    )
+    parser.add_argument(
+        "--trace-http",
+        action="store_true",
+        default=False,
+        help="Log full CSFloat HTTP request/response bodies (useful for debugging API issues)",
+    )
     args = parser.parse_args()
 
-    _setup_logging(args.log_level)
+    _setup_logging(
+        level=args.log_level,
+        log_file=args.log_file,
+        trace_http=args.trace_http,
+    )
     log = logging.getLogger(__name__)
 
+    # Handle SIGTERM (e.g. systemd / Docker stop) the same as Ctrl+C
+    signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
+
     try:
-        asyncio.run(amain(_resolve_path(args.config), _resolve_path(args.cookies)))
+        asyncio.run(
+            amain(
+                _resolve_path(args.config),
+                _resolve_path(args.cookies),
+                trace_http=args.trace_http,
+            )
+        )
     except cfg_module.ConfigError as exc:
         log.error("Configuration error: %s", exc)
         sys.exit(1)
