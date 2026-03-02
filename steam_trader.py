@@ -22,6 +22,7 @@ log = logging.getLogger(__name__)
 
 _CS2 = AppContext.CS2
 _STEAMID64_BASE = 76561197960265728
+_KEEPALIVE_INTERVAL = 20 * 60  # check every 20 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +67,7 @@ class SteamTrader:
         self._client = client
         self._steam_id = steam_id
         self._cookie_path = cookie_path
+        self._keepalive_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # Construction
@@ -96,9 +98,16 @@ class SteamTrader:
 
     async def __aenter__(self) -> "SteamTrader":
         await self._login()
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         return self
 
     async def __aexit__(self, *_: object) -> None:
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except asyncio.CancelledError:
+                pass
         await self._client.session.close()
 
     # ------------------------------------------------------------------
@@ -108,6 +117,23 @@ class SteamTrader:
     async def _login(self) -> None:
         await _retry(self._client.login, label="steam_login")
         log.info("Logged in to Steam")
+
+    async def _keepalive_loop(self) -> None:
+        """Background task: re-login whenever the Steam session expires."""
+        while True:
+            await asyncio.sleep(_KEEPALIVE_INTERVAL)
+            try:
+                alive = await self._client.is_session_alive()
+                if alive:
+                    log.debug("Keep-alive: Steam session OK")
+                else:
+                    log.warning("Keep-alive: session expired — re-logging in")
+                    await _retry(self._client.login, label="keepalive_login")
+                    log.info("Keep-alive: session restored")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.error("Keep-alive: unexpected error: %s", exc)
 
     # ------------------------------------------------------------------
     # Inventory
