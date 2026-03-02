@@ -39,7 +39,7 @@ def _setup_logging(level: str = "INFO") -> None:
     fmt = "%(asctime)s  %(levelname)-8s  %(name)s — %(message)s"
     logging.basicConfig(level=getattr(logging, level.upper(), logging.INFO), format=fmt)
     # Quiet down noisy third-party loggers
-    for name in ("aiohttp", "asyncio", "aiosteampy"):
+    for name in ("aiohttp", "asyncio", "steampy", "urllib3"):
         logging.getLogger(name).setLevel(logging.WARNING)
 
 

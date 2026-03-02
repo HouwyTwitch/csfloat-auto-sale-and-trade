@@ -1,12 +1,8 @@
 """
 Steam-side trade logic: send offers and confirm them via Steam Guard.
 
-Wraps aiosteampy's SteamClient to provide:
-  - Session restore / login with retry
-  - Inventory fetch
-  - Trade offer creation
-  - Mobile confirmation via identity_secret
-  - Cookie persistence
+Uses steampy (synchronous, requests-based) wrapped in asyncio.to_thread()
+so it fits naturally into the async processing loop.
 """
 
 from __future__ import annotations
@@ -14,161 +10,39 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from base64 import b64encode
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-import aiohttp
-from aiosteampy import SteamClient, AppContext
-from aiosteampy.helpers import restore_from_cookies
-from aiosteampy.mixins.guard import SteamGuardMixin
-from aiosteampy.mixins.login import REFERER_HEADER, API_HEADERS
-from aiosteampy.mixins.web_api import SteamWebApiMixin
-from aiosteampy.utils import get_jsonable_cookies
-from aiosteampy.exceptions import LoginError
-from aiosteampy.constants import STEAM_URL
-
-try:
-    from aiosteampy import auth_pb2 as _auth_pb2
-    from rsa import encrypt as _rsa_encrypt
-    _PROTOBUF_OK = True
-except ImportError:
-    _PROTOBUF_OK = False
-
-if TYPE_CHECKING:
-    from aiosteampy.models import TradeOffer
+import requests.exceptions
+from steampy.client import SteamClient, Asset
+from steampy.exceptions import ApiException, InvalidCredentials, LoginRequired
+from steampy.models import GameOptions, TradeOfferState
 
 log = logging.getLogger(__name__)
 
-# CS2 game / inventory context
-_CS2_CTX = AppContext.CS2
+# CS2 inventory context
+_CS2 = GameOptions.CS
+
+# SteamID64 base offset
+_STEAMID64_BASE = 76561197960265728
 
 
 # ---------------------------------------------------------------------------
-# Extended Steam client (adds Guard + WebAPI mixins + login bugfix)
+# Lightweight adapter types so processor.py needs no changes
 # ---------------------------------------------------------------------------
 
-# Headers matching a real browser request to Steam's auth API.
-# The library only sends Referer; missing Origin causes 400 on some endpoints.
-_AUTH_HEADERS = {
-    **API_HEADERS,
-    **REFERER_HEADER,
-    "Origin": str(STEAM_URL.COMMUNITY),
-}
+@dataclass
+class _OfferItem:
+    asset_id: int
 
 
-def _multipart(encoded: str) -> aiohttp.FormData:
-    """Wrap a base64-encoded protobuf string in multipart/form-data.
-
-    Steam's IAuthenticationService endpoints require multipart/form-data,
-    NOT application/x-www-form-urlencoded (which aiohttp uses for plain dicts).
-    The library sends plain dicts → Steam returns 400 Bad Request.
-    """
-    form = aiohttp.FormData()
-    form.add_field("input_protobuf_encoded", encoded)
-    return form
-
-
-class _SteamClient(SteamClient, SteamWebApiMixin, SteamGuardMixin):
-    """
-    Extended SteamClient that fixes the library's login encoding bug.
-
-    aiosteampy sends `BeginAuthSessionViaCredentials` and `PollAuthSessionStatus`
-    as `application/x-www-form-urlencoded` (plain dict → aiohttp default).
-    Steam changed these endpoints to require `multipart/form-data`.
-    We override both methods to use `aiohttp.FormData` and add the missing
-    `Origin` header.
-    """
-
-    async def _begin_auth_session_with_credentials(self) -> dict:
-        if not _PROTOBUF_OK:
-            raise LoginError(
-                "protobuf package is required. Run: pip install protobuf"
-            )
-
-        pub_key, ts = await self._get_rsa_key()
-
-        device = _auth_pb2.CAuthentication_BeginAuthSessionViaCredentials_Request.DeviceDetails()
-        device.device_friendly_name = self.user_agent or "Unknown"
-        device.platform_type = _auth_pb2.k_EAuthTokenPlatformType_WebBrowser
-
-        req = _auth_pb2.CAuthentication_BeginAuthSessionViaCredentials_Request()
-        req.account_name = self.username
-        req.encrypted_password = b64encode(
-            _rsa_encrypt(self._password.encode(), pub_key)
-        ).decode()
-        req.encryption_timestamp = ts
-        req.remember_login = 1
-        req.persistence = 1
-        req.website_id = "Community"
-        req.device_details.CopyFrom(device)
-        req.additional_field = 8
-
-        encoded = b64encode(req.SerializeToString()).decode()
-
-        # FIX: multipart/form-data instead of x-www-form-urlencoded
-        r = await self.session.post(
-            STEAM_URL.API.IAuthService.BeginAuthSessionViaCredentials,
-            data=_multipart(encoded),
-            headers=_AUTH_HEADERS,
-        )
-
-        if r.status != 200:
-            body = await r.text()
-            raise LoginError(f"BeginAuthSession failed {r.status}: {body}")
-
-        ct = r.content_type
-        if ct == "application/json":
-            return await r.json()
-        if ct in ("application/x-protobuf", "application/octet-stream"):
-            resp = _auth_pb2.CAuthentication_BeginAuthSessionViaCredentials_Response()
-            resp.ParseFromString(await r.read())
-            return {
-                "response": {
-                    "client_id": resp.client_id,
-                    "request_id": resp.request_id,   # bytes
-                    "steamid": str(resp.steamid),
-                }
-            }
-        raise LoginError(f"Unexpected content-type from BeginAuthSession: {ct}")
-
-    async def _poll_auth_session_status(
-        self, client_id: int | str, request_id: bytes | str
-    ) -> tuple[str, str]:
-        if not _PROTOBUF_OK:
-            raise LoginError(
-                "protobuf package is required. Run: pip install protobuf"
-            )
-
-        poll = _auth_pb2.CAuthentication_PollAuthSessionStatus_Request()
-        poll.client_id = int(client_id)   # must be int; JSON response may give str
-        poll.request_id = request_id if isinstance(request_id, bytes) else request_id.encode()
-
-        encoded = b64encode(poll.SerializeToString()).decode()
-
-        # FIX: multipart/form-data instead of x-www-form-urlencoded
-        r = await self.session.post(
-            STEAM_URL.API.IAuthService.PollAuthSessionStatus,
-            data=_multipart(encoded),
-            headers=_AUTH_HEADERS,
-        )
-
-        if r.status != 200:
-            body = await r.text()
-            raise LoginError(f"PollAuthSessionStatus failed {r.status}: {body}")
-
-        ct = r.content_type
-        if ct == "application/json":
-            rj = await r.json()
-            resp = rj.get("response", {})
-            if resp.get("had_remote_interaction"):
-                raise LoginError("PollAuthSessionStatus: had_remote_interaction", rj)
-            return resp["access_token"], resp["refresh_token"]
-        if ct in ("application/x-protobuf", "application/octet-stream"):
-            resp_pb = _auth_pb2.CAuthentication_PollAuthSessionStatus_Response()
-            resp_pb.ParseFromString(await r.read())
-            return resp_pb.access_token, resp_pb.refresh_token
-        raise LoginError(f"Unexpected content-type from PollAuthSessionStatus: {ct}")
+@dataclass
+class SentOffer:
+    """Wraps a steampy trade-offer dict into attribute form for processor.py."""
+    trade_offer_id: int
+    partner_id: int          # 32-bit account ID (as returned by Steam API)
+    status: TradeOfferState
+    items_to_give: list[_OfferItem] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -177,49 +51,64 @@ class _SteamClient(SteamClient, SteamWebApiMixin, SteamGuardMixin):
 
 class SteamTrader:
     """
-    High-level async helper for Steam trade operations.
+    High-level helper for Steam trade operations (login, inventory, offers,
+    confirmations).  All steampy calls are synchronous and are run in a
+    thread pool via asyncio.to_thread() so they are safe to await.
 
     Usage::
 
-        trader = SteamTrader.from_config(cfg)
-        async with trader:
-            offer_id = await trader.send_offer(buyer_id, [asset_id], trade_url)
-            await trader.confirm_offer(offer_id)
+        async with SteamTrader.from_config(cfg, Path("cookies.json")) as trader:
+            offer_id = await trader.send_offer(...)
     """
 
-    def __init__(self, client: _SteamClient, cookie_path: Path) -> None:
+    def __init__(
+        self,
+        client: SteamClient,
+        username: str,
+        password: str,
+        steam_guard_json: str,
+        steam_id: int,
+        cookie_path: Path,
+    ) -> None:
         self._client = client
+        self._username = username
+        self._password = password
+        self._steam_guard_json = steam_guard_json
+        self._steam_id = steam_id
         self._cookie_path = cookie_path
 
     # ------------------------------------------------------------------
-    # Construction helpers
+    # Construction
     # ------------------------------------------------------------------
 
     @classmethod
     def from_config(cls, cfg: dict, cookie_path: Path) -> "SteamTrader":
         """Build a SteamTrader from the parsed config dict."""
-        proxy: str | None = cfg.get("client_proxy") or None
-        kwargs: dict = dict(
-            steam_id=int(cfg["steam_id64"]),
+        # steampy's login() accepts a JSON string for steam_guard
+        steam_guard_json = json.dumps({
+            "steamid": str(cfg["steam_id64"]),
+            "shared_secret": cfg["shared_secret"],
+            "identity_secret": cfg["identity_secret"],
+        })
+
+        api_key: str = cfg.get("steam_api_key") or ""
+        proxies: dict | None = None
+        if cfg.get("client_proxy") and cfg.get("steam_use_proxy"):
+            p = cfg["client_proxy"]
+            proxies = {"http": p, "https": p}
+
+        client = SteamClient(api_key, proxies=proxies)
+        return cls(
+            client=client,
             username=cfg["steam_login"],
             password=cfg["steam_password"],
-            shared_secret=cfg["shared_secret"],
-            identity_secret=cfg["identity_secret"],
-            api_key=cfg.get("steam_api_key") or None,
-            user_agent=cfg.get("user_agent") or (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/136.0.0.0 Safari/537.36"
-            ),
+            steam_guard_json=steam_guard_json,
+            steam_id=int(cfg["steam_id64"]),
+            cookie_path=cookie_path,
         )
-        if proxy and cfg.get("steam_use_proxy"):
-            kwargs["proxy"] = proxy
-
-        client = _SteamClient(**kwargs)
-        return cls(client, cookie_path)
 
     # ------------------------------------------------------------------
-    # Context manager (handles login + cookie save on exit)
+    # Context manager
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> "SteamTrader":
@@ -227,52 +116,58 @@ class SteamTrader:
         return self
 
     async def __aexit__(self, *_: object) -> None:
-        await self._save_cookies()
-        if not self._client.session.closed:
-            await self._client.session.close()
+        await asyncio.to_thread(self._save_cookies_sync)
 
     # ------------------------------------------------------------------
     # Session management
     # ------------------------------------------------------------------
 
+    def _save_cookies_sync(self) -> None:
+        try:
+            cookies = self._client.session.cookies.get_dict()
+            self._cookie_path.write_text(json.dumps(cookies, indent=2))
+            log.debug("Steam cookies saved to %s", self._cookie_path)
+        except Exception as exc:
+            log.warning("Failed to save Steam cookies: %s", exc)
+
     async def _login(self) -> None:
-        """Restore session from cookies if available, otherwise do a fresh login."""
+        """Restore session from cookies, or do a fresh credential login."""
         if self._cookie_path.is_file():
             try:
                 cookies = json.loads(self._cookie_path.read_text())
-                await _with_retry(
-                    lambda: restore_from_cookies(cookies, self._client),
-                    label="restore_cookies",
-                )
-                log.info("Steam session restored from cookies (account: %s)", self._client.username)
-                return
+                await asyncio.to_thread(self._client.set_login_cookies, cookies)
+                alive = await asyncio.to_thread(self._client.is_session_alive)
+                if alive:
+                    log.info("Steam session restored from cookies")
+                    return
+                log.warning("Saved cookies expired — doing fresh login")
             except Exception as exc:
-                log.warning("Could not restore cookies (%s), doing fresh login", exc)
+                log.warning("Could not restore cookies (%s) — doing fresh login", exc)
 
-        await _with_retry(self._client.login, label="steam_login")
-        log.info("Logged in to Steam as %s", self._client.username)
-
-    async def _save_cookies(self) -> None:
-        """Persist session cookies for next run."""
-        try:
-            cookies = get_jsonable_cookies(self._client.session)
-            self._cookie_path.write_text(json.dumps(cookies, indent=2))
-            log.debug("Steam session cookies saved to %s", self._cookie_path)
-        except Exception as exc:
-            log.warning("Failed to save Steam cookies: %s", exc)
+        await _with_retry(
+            lambda: self._client.login(
+                self._username, self._password, self._steam_guard_json
+            ),
+            label="steam_login",
+        )
+        log.info("Logged in to Steam as %s", self._username)
 
     # ------------------------------------------------------------------
     # Inventory
     # ------------------------------------------------------------------
 
-    async def fetch_inventory(self) -> list:
-        """Return all CS2 inventory items."""
-        items, _, _ = await _with_retry(
-            lambda: self._client.get_inventory(_CS2_CTX, count=5000),
+    async def fetch_inventory(self) -> dict:
+        """
+        Return the CS2 inventory as a merged dict keyed by asset_id string.
+
+        steampy returns a flat dict: {"asset_id_str": {item info}, ...}
+        """
+        inv = await _with_retry(
+            lambda: self._client.get_my_inventory(_CS2, merge=True, count=5000),
             label="get_inventory",
         )
-        log.info("Fetched %d inventory items", len(items))
-        return list(items)
+        log.info("Fetched %d inventory items", len(inv))
+        return inv
 
     # ------------------------------------------------------------------
     # Trade offers
@@ -285,28 +180,32 @@ class SteamTrader:
         trade_url: str | None,
         trade_token: str | None,
         message: str,
-    ) -> int | None:
+    ) -> str | None:
         """
-        Create a Steam trade offer giving *asset_ids* to the buyer.
+        Send a Steam trade offer giving *asset_ids* to the buyer.
 
-        Returns the Steam trade offer ID on success, or None on failure.
+        Returns the trade offer ID string on success, or None on failure.
+        Confirmation is handled automatically by steampy when the offer is sent.
         """
         if not asset_ids:
             log.warning("send_offer called with empty asset_ids — skipping")
             return None
 
         inventory = await self.fetch_inventory()
-        items_to_give = _find_items(inventory, asset_ids)
-        if not items_to_give:
-            log.error(
-                "None of the requested asset_ids %s were found in inventory", asset_ids
-            )
-            return None
-        if len(items_to_give) != len(asset_ids):
-            missing = set(asset_ids) - {i.asset_id for i in items_to_give}
+
+        # Build Asset objects, verifying every item is in the inventory
+        assets: list[Asset] = []
+        for aid in asset_ids:
+            if str(aid) in inventory:
+                assets.append(Asset(str(aid), _CS2))
+            else:
+                log.error("asset_id %s not found in inventory", aid)
+
+        if len(assets) != len(asset_ids):
+            missing = set(asset_ids) - {int(a.asset_id) for a in assets}
             log.error(
                 "Cannot send partial trade — missing asset_ids: %s. "
-                "Aborting offer to avoid CSFloat verification failure.",
+                "Aborting to avoid CSFloat verification failure.",
                 missing,
             )
             return None
@@ -314,41 +213,70 @@ class SteamTrader:
         log.info(
             "Sending trade offer to %s with %d item(s)…",
             buyer_steam_id,
-            len(items_to_give),
+            len(assets),
         )
 
-        kwargs: dict = dict(
-            to_give=items_to_give,
-            to_receive=[],
-            message=message,
-            confirm=False,      # We confirm separately for better control
-        )
-
-        if trade_url:
-            target = trade_url
-        else:
-            target = buyer_steam_id
+        # Build a trade URL if we have the components but not a full URL
+        if not trade_url:
             if trade_token:
-                kwargs["token"] = trade_token
+                account_id = (
+                    buyer_steam_id - _STEAMID64_BASE
+                    if buyer_steam_id > _STEAMID64_BASE
+                    else buyer_steam_id
+                )
+                trade_url = (
+                    f"https://steamcommunity.com/tradeoffer/new/"
+                    f"?partner={account_id}&token={trade_token}"
+                )
 
-        offer_id = await _with_retry(
-            lambda: self._client.make_trade_offer(target, **kwargs),
-            label=f"make_trade_offer(buyer={buyer_steam_id})",
-        )
-        log.info("Trade offer %s sent successfully", offer_id)
+        try:
+            if trade_url:
+                # make_offer_with_url auto-confirms when needs_mobile_confirmation
+                result = await _with_retry(
+                    lambda: self._client.make_offer_with_url(
+                        items_from_me=assets,
+                        items_from_them=[],
+                        trade_offer_url=trade_url,
+                        message=message,
+                        confirm_trade=True,
+                    ),
+                    label=f"make_offer_with_url(buyer={buyer_steam_id})",
+                )
+            else:
+                # make_offer also auto-confirms when needs_mobile_confirmation
+                result = await _with_retry(
+                    lambda: self._client.make_offer(
+                        items_from_me=assets,
+                        items_from_them=[],
+                        partner_steam_id=str(buyer_steam_id),
+                        message=message,
+                    ),
+                    label=f"make_offer(buyer={buyer_steam_id})",
+                )
+        except Exception as exc:
+            log.error("Failed to send trade offer to %s: %s", buyer_steam_id, exc)
+            return None
+
+        offer_id: str | None = (result or {}).get("tradeofferid")
+        if offer_id:
+            log.info("Trade offer %s sent (and auto-confirmed if required)", offer_id)
+        else:
+            log.error("Offer sent but no tradeofferid in response: %s", result)
         return offer_id
 
-    async def confirm_offer(self, offer_id: int) -> bool:
+    async def confirm_offer(self, offer_id: str | int) -> bool:
         """
-        Confirm a pending Steam trade offer via mobile/Steam Guard confirmation.
+        Explicitly confirm a trade offer via Steam Guard.
 
-        Returns True if confirmed, False otherwise.
+        steampy's make_offer* already calls _confirm_transaction internally
+        when the offer needs confirmation, so this is mostly a safety-net for
+        cases where that auto-confirm failed.
         """
         log.info("Confirming trade offer %s…", offer_id)
         try:
             await _with_retry(
-                lambda: self._client.confirm_trade_offer(offer_id),
-                label=f"confirm_trade_offer({offer_id})",
+                lambda: self._client._confirm_transaction(str(offer_id)),
+                label=f"confirm_transaction({offer_id})",
             )
             log.info("Trade offer %s confirmed", offer_id)
             return True
@@ -358,61 +286,113 @@ class SteamTrader:
 
     async def confirm_all_pending(self) -> None:
         """
-        Confirm ALL pending trade confirmations (broad sweep).
+        Confirm all Active/ConfirmationNeed sent trade offers (broad sweep).
 
-        Use only as a safety net after sending offers.
+        Called as a fallback after per-offer confirmation fails.
         """
         try:
-            confirmations = await _with_retry(
-                self._client.get_confirmations,
-                label="get_confirmations",
+            # Use merge=False to get the raw offer list without description merging
+            raw = await _with_retry(
+                lambda: self._client.get_trade_offers(
+                    merge=False,
+                    get_sent_offers=True,
+                    get_received_offers=False,
+                ),
+                label="get_trade_offers_for_confirm_all",
             )
-            if not confirmations:
-                log.debug("No pending confirmations")
-                return
-
-            for conf in confirmations:
-                try:
-                    key, ts = await self._client._gen_confirmation_key(tag="conf")
-                    result = await self._client.confirm_confirmation(conf, key, ts)
-                    if result:
-                        log.info("Confirmed trade confirmation (offer_id=%s)", conf.offer_id)
-                    else:
-                        log.warning("Confirmation returned False for offer_id=%s", conf.offer_id)
-                except Exception as exc:
-                    log.error("Error confirming %s: %s", conf.offer_id, exc)
+            sent = (raw or {}).get("response", {}).get("trade_offers_sent", [])
+            for offer in sent:
+                state = offer.get("trade_offer_state")
+                if state in (TradeOfferState.Active, TradeOfferState.ConfirmationNeed):
+                    oid = offer.get("tradeofferid")
+                    if oid:
+                        try:
+                            await asyncio.to_thread(
+                                self._client._confirm_transaction, str(oid)
+                            )
+                            log.info("confirm_all_pending: confirmed offer %s", oid)
+                        except Exception as exc:
+                            log.warning(
+                                "confirm_all_pending: failed for offer %s: %s", oid, exc
+                            )
         except Exception as exc:
-            log.error("Error fetching confirmations: %s", exc)
+            log.error("confirm_all_pending: error: %s", exc)
 
-    async def get_active_sent_offers(self) -> list["TradeOffer"]:
-        """Return all active sent trade offers."""
-        sent, _, _ = await _with_retry(
-            lambda: self._client.get_trade_offers(active_only=False, received=False),
-            label="get_trade_offers",
-        )
-        return list(sent)
+    async def get_active_sent_offers(self) -> list[SentOffer]:
+        """
+        Return active sent trade offers as SentOffer adapter objects.
+
+        Note: steampy's get_trade_offers only returns Active offers by default.
+        """
+        try:
+            raw = await _with_retry(
+                lambda: self._client.get_trade_offers(
+                    merge=False,
+                    get_sent_offers=True,
+                    get_received_offers=False,
+                ),
+                label="get_trade_offers",
+            )
+        except Exception as exc:
+            log.error("Failed to fetch sent trade offers: %s", exc)
+            return []
+
+        sent_raw: list[dict] = (raw or {}).get("response", {}).get("trade_offers_sent", [])
+        result: list[SentOffer] = []
+        for offer in sent_raw:
+            try:
+                items = [
+                    _OfferItem(asset_id=int(i["assetid"]))
+                    for i in offer.get("items_to_give", [])
+                ]
+                result.append(SentOffer(
+                    trade_offer_id=int(offer["tradeofferid"]),
+                    # accountid_other is already 32-bit (not SteamID64)
+                    partner_id=int(offer["accountid_other"]),
+                    status=TradeOfferState(int(offer["trade_offer_state"])),
+                    items_to_give=items,
+                ))
+            except (KeyError, ValueError, TypeError) as exc:
+                log.warning("Skipping malformed offer entry: %s", exc)
+
+        return result
 
     @property
     def steam_id(self) -> int:
-        return int(self._client.steam_id)
+        return self._steam_id
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def _with_retry(coro_fn, *, label: str = "", max_attempts: int = 6, base_delay: float = 3.0):
+async def _with_retry(
+    fn,
+    *,
+    label: str = "",
+    max_attempts: int = 6,
+    base_delay: float = 3.0,
+):
     """
-    Run an async coroutine factory with exponential-backoff retry.
+    Run a synchronous callable in a thread pool with exponential-backoff retry.
 
-    *coro_fn* is a zero-argument callable that returns a coroutine each time
-    it is called (i.e., a lambda wrapping an ``await``-able expression).
+    Only retries on transient network errors (ConnectionError, Timeout, OSError).
+    Non-transient exceptions (InvalidCredentials, ApiException, etc.) propagate
+    immediately without retry.
     """
+    import requests.exceptions as req_exc
+
     delay = base_delay
     for attempt in range(1, max_attempts + 2):
         try:
-            return await coro_fn()
-        except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionError) as exc:
+            return await asyncio.to_thread(fn)
+        except (
+            req_exc.ConnectionError,
+            req_exc.Timeout,
+            req_exc.ChunkedEncodingError,
+            OSError,
+            TimeoutError,
+        ) as exc:
             if attempt > max_attempts:
                 log.error("[%s] Giving up after %d attempts: %s", label, attempt, exc)
                 raise
@@ -422,18 +402,6 @@ async def _with_retry(coro_fn, *, label: str = "", max_attempts: int = 6, base_d
             )
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60.0)
-
-
-def _find_items(inventory: list, asset_ids: list[int]) -> list:
-    """Return inventory items whose asset_id is in *asset_ids*."""
-    target = set(asset_ids)
-    found: list = []
-    for item in inventory:
-        if item.asset_id in target:
-            found.append(item)
-            target.discard(item.asset_id)
-            if not target:
-                break
-    return found
-
-
+        except Exception:
+            # Non-transient: propagate immediately (wrong credentials, API error, etc.)
+            raise

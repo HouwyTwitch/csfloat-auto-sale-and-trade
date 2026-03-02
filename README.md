@@ -25,7 +25,7 @@ any trades that arrived during processing.
 ## Requirements
 
 - Python 3.11+
-- A Steam account with mobile authenticator (`.maFile` secrets)
+- A Steam account with mobile authenticator (`shared_secret` + `identity_secret` from your `.maFile`)
 - A CSFloat API key (Profile → Developer tab on csfloat.com)
 
 ## Installation
@@ -35,6 +35,8 @@ git clone https://github.com/HouwyTwitch/csfloat-auto-sale-and-trade
 cd csfloat-auto-sale-and-trade
 pip install -r requirements.txt
 ```
+
+> **Note:** `steampy` is installed directly from [crab713/steampy](https://github.com/crab713/steampy) via pip's git support. Make sure `git` is available in your PATH.
 
 ## Configuration
 
@@ -51,9 +53,9 @@ cp config.example.json config.json
 | `steam_password` | Yes | Steam password |
 | `shared_secret` | Yes | From `.maFile` — used for 2FA login |
 | `identity_secret` | Yes | From `.maFile` — used to confirm trades |
-| `steam_api_key` | No | Steam Web API key (not required since Mar 2024) |
+| `steam_api_key` | No | Steam Web API key |
 | `client_proxy` | No | Proxy URL e.g. `socks5://user:pass@host:port` |
-| `steam_use_proxy` | No | Apply proxy to Steam client too (default: false) |
+| `steam_use_proxy` | No | Apply proxy to Steam requests too (default: false) |
 | `notif_interval_seconds` | No | Notification poll interval (default: 15) |
 | `heartbeat_interval_seconds` | No | Heartbeat poll interval (default: 60) |
 | `post_run_delay_seconds` | No | Delay before post-cycle re-check (default: 5) |
@@ -75,7 +77,7 @@ Press **Ctrl+C** to stop gracefully. Steam session cookies are saved to
 main.py            — entry point, argument parsing, wires everything together
 config.py          — config loading + validation
 csfloat_client.py  — CSFloat REST API wrapper (polling, accept, etc.)
-steam_trader.py    — aiosteampy wrapper (login, send offer, confirm)
+steam_trader.py    — steampy wrapper (login, send offer, confirm)
 processor.py       — trade lifecycle orchestration + fast polling loop
 requirements.txt
 config.example.json
@@ -84,4 +86,4 @@ config.example.json
 ## Credits
 
 Inspired by [CSFloat-Auto-Trade-Patched](https://github.com/redlfox/CSFloat-Auto-Trade-Patched).
-Rewritten from scratch for cleaner async structure and faster notification-driven polling.
+Uses [crab713/steampy](https://github.com/crab713/steampy) for Steam interaction.
