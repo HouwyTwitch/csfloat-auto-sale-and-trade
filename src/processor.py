@@ -13,7 +13,7 @@ Full lifecycle per trade:
   2. Bulk-accept queued trades on CSFloat.
   3. Send Steam trade offer to buyer.
   4. Confirm the trade offer via Steam Guard.
-  5. CSFloat detects the on-chain trade automatically (no extra API call).
+  5. Notify CSFloat via steam-status API (mirrors the browser extension).
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ from typing import Any
 
 from aiosteampy import TradeOfferStatus
 
-from csfloat_client import CSFloatClient
-from steam_trader import SteamTrader
+from .csfloat_client import CSFloatClient
+from .steam_trader import SteamTrader
 
 log = logging.getLogger(__name__)
 
