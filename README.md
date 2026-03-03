@@ -142,3 +142,4 @@ config.example.json
 
 Inspired by [CSFloat-Auto-Trade-Patched](https://github.com/redlfox/CSFloat-Auto-Trade-Patched).
 Uses [aiosteampy](https://github.com/somespecialone/aiosteampy) for async Steam interaction.
+Steam-status notification flow reverse-engineered from the [CSFloat Chrome Extension](https://github.com/csfloat/extension).
