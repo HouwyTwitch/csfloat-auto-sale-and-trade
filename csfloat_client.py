@@ -22,11 +22,16 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _BASE = "https://csfloat.com/api/v1"
 
-URL_ME            = f"{_BASE}/me"
-URL_NOTIFICATIONS = f"{_BASE}/me/notifications"
-URL_TRADES        = f"{_BASE}/me/trades"
-URL_ACCEPT_BULK   = f"{_BASE}/trades/bulk/accept"
-URL_ACCEPT_ONE    = f"{_BASE}/trades/{{trade_id}}/accept"
+URL_ME                   = f"{_BASE}/me"
+URL_NOTIFICATIONS        = f"{_BASE}/me/notifications"
+URL_TRADES               = f"{_BASE}/me/trades"
+URL_ACCEPT_BULK          = f"{_BASE}/trades/bulk/accept"
+URL_ACCEPT_ONE           = f"{_BASE}/trades/{{trade_id}}/accept"
+URL_STEAM_STATUS_OFFER   = f"{_BASE}/trades/steam-status/offer"
+URL_STEAM_STATUS_NEW_OFFER = f"{_BASE}/trades/steam-status/new-offer"
+
+# Steam TradeOfferState enum values
+TRADE_STATE_ACTIVE = 2
 
 
 class CSFloatAPIError(Exception):
@@ -235,6 +240,79 @@ class CSFloatClient:
             return True
         except CSFloatAPIError as exc:
             log.error("Accept trade %s failed: %s", trade_id, exc)
+            return False
+
+    async def annotate_offer(
+        self,
+        offer_id: str,
+        given_asset_ids: list[int],
+        buyer_steam_id64: int,
+    ) -> bool:
+        """
+        Link a Steam trade offer to CSFloat's internal trade records.
+
+        Equivalent to what the CSFloat browser extension does via
+        POST /api/v1/trades/steam-status/new-offer when it detects an offer
+        sent outside the extension (i.e. sent by this bot).
+        """
+        payload = {
+            "offer_id": offer_id,
+            "given_asset_ids": [str(a) for a in given_asset_ids],
+            "received_asset_ids": [],
+            "other_steam_id64": str(buyer_steam_id64),
+        }
+        try:
+            await self._request(
+                "POST",
+                URL_STEAM_STATUS_NEW_OFFER,
+                json=payload,
+                label=f"annotate_offer({offer_id})",
+            )
+            return True
+        except CSFloatAPIError as exc:
+            log.warning("annotate_offer(%s) failed: %s", offer_id, exc)
+            return False
+
+    async def ping_offer_status(
+        self,
+        offer_id: str,
+        given_asset_ids: list[int],
+        buyer_steam_id64: int,
+        time_created: int | None = None,
+    ) -> bool:
+        """
+        Report the current status of a sent Steam trade offer to CSFloat.
+
+        Equivalent to what the CSFloat browser extension does via
+        POST /api/v1/trades/steam-status/offer after confirming an offer.
+        Reports state=2 (Active) — the offer is confirmed and awaiting buyer acceptance.
+        """
+        import time as _time
+        now = int(_time.time())
+        payload = {
+            "sent_offers": [
+                {
+                    "offer_id": offer_id,
+                    "state": TRADE_STATE_ACTIVE,
+                    "given_asset_ids": [str(a) for a in given_asset_ids],
+                    "received_asset_ids": [],
+                    "time_created": time_created or now,
+                    "time_updated": now,
+                    "other_steam_id64": str(buyer_steam_id64),
+                }
+            ],
+            "type": 1,  # 1 = API source (vs 2 = HTML scrape)
+        }
+        try:
+            await self._request(
+                "POST",
+                URL_STEAM_STATUS_OFFER,
+                json=payload,
+                label=f"ping_offer_status({offer_id})",
+            )
+            return True
+        except CSFloatAPIError as exc:
+            log.warning("ping_offer_status(%s) failed: %s", offer_id, exc)
             return False
 
 

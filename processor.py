@@ -233,6 +233,42 @@ class TradeProcessor:
             )
             await self._st.confirm_all_pending()
 
+        # --- Notify CSFloat that the offer has been sent and confirmed ---
+        # Mirrors what the CSFloat browser extension does: annotate the offer so
+        # CSFloat can link this Steam offer_id to its own trade record, then
+        # report its current state (Active = 2) so CSFloat knows it's live.
+        await self._ping_offer_to_csfloat(offer_id, plan)
+
+
+    async def _ping_offer_to_csfloat(self, offer_id: str, plan: OfferPlan) -> None:
+        """
+        Tell CSFloat about the Steam offer we just sent & confirmed.
+
+        Two calls, matching the CSFloat browser extension behaviour:
+          1. annotate_offer  — links the Steam offer_id to CSFloat's trade record
+                               by matching the given_asset_ids.
+          2. ping_offer_status — reports the offer's current state (Active = 2)
+                                 so CSFloat knows it is live and awaiting the buyer.
+        """
+        ok1 = await self._cf.annotate_offer(
+            offer_id=offer_id,
+            given_asset_ids=plan.asset_ids,
+            buyer_steam_id64=plan.buyer_id,
+        )
+        ok2 = await self._cf.ping_offer_status(
+            offer_id=offer_id,
+            given_asset_ids=plan.asset_ids,
+            buyer_steam_id64=plan.buyer_id,
+        )
+        if ok1 and ok2:
+            log.info("CSFloat notified: offer %s linked and status reported.", offer_id)
+        else:
+            log.warning(
+                "CSFloat notification partial failure for offer %s "
+                "(annotate=%s, status=%s) — CSFloat may detect the trade later via its own monitoring.",
+                offer_id, ok1, ok2,
+            )
+
 
 # ---------------------------------------------------------------------------
 # Notification-driven polling loop
