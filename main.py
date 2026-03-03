@@ -29,10 +29,10 @@ from pathlib import Path
 import aiohttp
 from aiohttp_socks.connector import ProxyConnector
 
-import config as cfg_module
-from csfloat_client import CSFloatClient
-from processor import NotificationPoller, TradeProcessor
-from steam_trader import SteamTrader
+import src.config as cfg_module
+from src.csfloat_client import CSFloatClient
+from src.processor import NotificationPoller, TradeProcessor
+from src.steam_trader import SteamTrader
 
 # ---------------------------------------------------------------------------
 # Logging setup

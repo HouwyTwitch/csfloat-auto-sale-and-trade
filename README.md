@@ -127,11 +127,13 @@ sudo journalctl -fu csfloat-bot   # follow live logs
 ## Project structure
 
 ```
-main.py             — entry point: argument parsing, logging setup, wires everything together
-config.py           — config loading and validation
-csfloat_client.py   — CSFloat REST API client (polling, accept, steam-status notify)
-steam_trader.py     — Steam client wrapper (login, inventory, send offer, confirm)
-processor.py        — trade lifecycle orchestration + fast notification polling loop
+main.py                   — entry point: argument parsing, logging setup, wires everything together
+src/
+    __init__.py
+    config.py             — config loading and validation
+    csfloat_client.py     — CSFloat REST API client (polling, accept, steam-status notify)
+    steam_trader.py       — Steam client wrapper (login, inventory, send offer, confirm)
+    processor.py          — trade lifecycle orchestration + fast notification polling loop
 requirements.txt
 config.example.json
 ```

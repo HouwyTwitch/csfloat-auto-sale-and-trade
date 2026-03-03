@@ -27,8 +27,8 @@ from typing import Any
 
 from aiosteampy import TradeOfferStatus
 
-from csfloat_client import CSFloatClient
-from steam_trader import SteamTrader
+from .csfloat_client import CSFloatClient
+from .steam_trader import SteamTrader
 
 log = logging.getLogger(__name__)
 
