@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any
 
 import aiohttp
@@ -287,8 +288,7 @@ class CSFloatClient:
         POST /api/v1/trades/steam-status/offer after confirming an offer.
         Reports state=2 (Active) — the offer is confirmed and awaiting buyer acceptance.
         """
-        import time as _time
-        now = int(_time.time())
+        now = int(time.time())
         payload = {
             "sent_offers": [
                 {
