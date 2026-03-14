@@ -16,9 +16,25 @@ import aiohttp
 from aiosteampy import SteamClient, TradeOfferStatus
 from aiosteampy.constants import AppContext
 from aiosteampy.exceptions import LoginError
-from aiosteampy.models import EconItem
+from aiosteampy.models import EconItem, ItemDescription
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Monkey-patch aiosteampy to handle CS2 inventory items whose "Inspect"
+# action link does not contain the "%D" placeholder.  Without this guard the
+# library raises IndexError: list index out of range.
+# ---------------------------------------------------------------------------
+def _patched_set_d_id(self: ItemDescription) -> None:
+    from aiosteampy.constants import App
+    if self.app is App.CS2:
+        i_action = next(filter(lambda a: "Inspect" in a.name, self.actions), None)
+        if i_action is not None:
+            parts = i_action.link.split("%D")
+            if len(parts) > 1:
+                object.__setattr__(self, "d_id", int(parts[1]))
+
+ItemDescription._set_d_id = _patched_set_d_id  # type: ignore[method-assign]
 
 _CS2 = AppContext.CS2
 _STEAMID64_BASE = 76561197960265728
