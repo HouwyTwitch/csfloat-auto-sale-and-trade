@@ -144,7 +144,7 @@ class SteamTrader:
                     log.debug("Keep-alive: Steam session OK")
                 else:
                     log.warning("Keep-alive: session expired — re-logging in")
-                    await _retry(self._client.login, label="keepalive_login")
+                    await _retry(self._client.login, label="keepalive_login", reauth_fn=self._client.login)
                     log.info("Keep-alive: session restored")
             except asyncio.CancelledError:
                 raise
@@ -171,6 +171,7 @@ class SteamTrader:
                     _CS2, count=2000, last_assetid=la
                 ),
                 label="get_inventory",
+                reauth_fn=self._client.login,
             )
             all_items.extend(items)
             if last is None:
@@ -243,6 +244,7 @@ class SteamTrader:
                     confirm=True,
                 ),
                 label=f"make_trade_offer(buyer={buyer_steam_id})",
+                reauth_fn=self._client.login,
             )
         except Exception as exc:
             log.error("Failed to send trade offer to %s: %s", buyer_steam_id, exc)
@@ -265,6 +267,7 @@ class SteamTrader:
             await _retry(
                 lambda: self._client.confirm_trade_offer(int(offer_id)),
                 label=f"confirm_trade_offer({offer_id})",
+                reauth_fn=self._client.login,
             )
             log.info("Trade offer %s confirmed", offer_id)
             return True
@@ -297,6 +300,7 @@ class SteamTrader:
             await _retry(
                 self._client.allow_all_confirmations,
                 label="allow_all_confirmations",
+                reauth_fn=self._client.login,
             )
             log.info("confirm_all_pending: all pending confirmations allowed")
         except Exception as exc:
@@ -314,6 +318,7 @@ class SteamTrader:
                     active_only=True,
                 ),
                 label="get_trade_offers",
+                reauth_fn=self._client.login,
             )
         except Exception as exc:
             log.error("Failed to fetch sent trade offers: %s", exc)
@@ -349,9 +354,15 @@ async def _retry(
     label: str = "",
     max_attempts: int = 6,
     base_delay: float = 3.0,
+    reauth_fn=None,
 ):
     """
     Retry an async callable on transient network errors with exponential backoff.
+
+    If *reauth_fn* is provided and a 401 Unauthorized response is received,
+    the function is called (awaited) to re-establish the Steam session before
+    retrying — without any extra sleep delay.  If no reauth_fn is supplied a
+    401 is treated as a non-transient error and propagates immediately.
 
     Non-transient exceptions (LoginError, etc.) propagate immediately.
     """
@@ -359,6 +370,36 @@ async def _retry(
     for attempt in range(1, max_attempts + 2):
         try:
             return await fn()
+        except aiohttp.ClientResponseError as exc:
+            if exc.status == 401:
+                if reauth_fn is None or attempt > max_attempts:
+                    log.error(
+                        "[%s] 401 Unauthorized — giving up (attempt %d/%d): %s",
+                        label, attempt, max_attempts + 1, exc,
+                    )
+                    raise
+                log.warning(
+                    "[%s] 401 Unauthorized (attempt %d/%d) — re-authenticating before retry",
+                    label, attempt, max_attempts + 1,
+                )
+                try:
+                    await reauth_fn()
+                except Exception as reauth_exc:
+                    log.error("[%s] Re-auth failed: %s — giving up", label, reauth_exc)
+                    raise exc from reauth_exc
+                # Reset delay after a successful re-auth
+                delay = base_delay
+                continue
+            # Other HTTP error codes: treat as transient
+            if attempt > max_attempts:
+                log.error("[%s] Giving up after %d attempts: %s", label, attempt, exc)
+                raise
+            log.warning(
+                "[%s] Transient error (attempt %d/%d): %s — retrying in %.1fs",
+                label, attempt, max_attempts + 1, exc, delay,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60.0)
         except (
             aiohttp.ClientError,
             asyncio.TimeoutError,
