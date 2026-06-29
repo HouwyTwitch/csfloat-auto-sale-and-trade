@@ -1,0 +1,38 @@
+# Secrets — never bake these into the image
+.env
+config.json
+cookies.json
+steam.json
+*.maFile
+
+# Git / CI
+.git
+.gitignore
+.github
+
+# Python caches and envs
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# State / logs
+processed_trades.json
+*.log
+
+# Editor / OS cruft
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Docs / Docker meta (not needed inside the image)
+README.md
+docker-compose.yml
+Dockerfile
+.dockerignore

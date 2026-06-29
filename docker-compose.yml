@@ -1,0 +1,28 @@
+services:
+  csfloat-bot:
+    build: .
+    image: csfloat-auto-sale-and-trade
+    container_name: csfloat-bot
+
+    # All credentials and tuning knobs are read from this file.
+    # Copy .env.example -> .env and fill it in.
+    env_file:
+      - .env
+
+    # Persist the Steam session cookies between restarts so the bot doesn't
+    # have to do a full re-login (and re-trigger Steam Guard) every time.
+    volumes:
+      - csfloat-data:/data
+
+    # Restart unless you explicitly stop it (e.g. survives reboots / crashes).
+    restart: unless-stopped
+
+    # Keep the log file from growing unbounded.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  csfloat-data:

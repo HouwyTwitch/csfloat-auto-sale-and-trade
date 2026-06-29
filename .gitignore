@@ -1,4 +1,5 @@
 # Secrets — never commit these
+.env
 config.json
 cookies.json
 steam.json
