@@ -25,11 +25,48 @@ After each processing cycle the bot waits 5 s then runs one more cycle to catch 
 
 ## Requirements
 
-- Python **3.11+**
 - Steam mobile authenticator (`shared_secret` + `identity_secret` — from your `.maFile`)
 - CSFloat API key (Profile → Developer tab on csfloat.com)
+- Either **Docker** (recommended — see below) **or** Python **3.11+**
 
-## Installation
+## Quick start with Docker (recommended)
+
+The easiest way to run the bot. Only Docker + Docker Compose are required — no Python setup.
+
+```bash
+git clone https://github.com/HouwyTwitch/csfloat-auto-sale-and-trade
+cd csfloat-auto-sale-and-trade
+
+# 1. Create your config from the template and fill in your credentials
+cp .env.example .env
+nano .env            # or any editor
+
+# 2. Build and start (runs in the background, restarts automatically)
+docker compose up -d --build
+
+# 3. Watch the live logs
+docker compose logs -f
+```
+
+That's it. Common commands:
+
+```bash
+docker compose logs -f          # follow live logs
+docker compose ps               # show status
+docker compose restart          # restart the bot
+docker compose down             # stop and remove the container
+docker compose up -d --build    # rebuild after pulling new code
+```
+
+The bot is configured entirely through the `.env` file — see [Configuration](#configuration)
+for every available setting. Your Steam session cookies are persisted in a named
+Docker volume (`csfloat-data`), so the bot avoids a full re-login (and Steam Guard
+prompt) on every restart.
+
+> **Updating:** `git pull` then `docker compose up -d --build`.
+> **Resetting the saved Steam session:** `docker compose down -v` (the `-v` removes the volume).
+
+## Manual installation (without Docker)
 
 ```bash
 git clone https://github.com/HouwyTwitch/csfloat-auto-sale-and-trade
@@ -51,25 +88,37 @@ These come from your Steam Guard `.maFile`. If you set up Steam mobile authentic
 
 ## Configuration
 
+The bot can be configured two ways. **Environment variables take precedence over
+`config.json`**, so you can use either — or mix them.
+
+**Option A — environment variables / `.env` (recommended, used by Docker):**
+
+```bash
+cp .env.example .env
+# edit .env with your credentials
+```
+
+**Option B — `config.json` (used by the manual / Python workflow):**
+
 ```bash
 cp config.example.json config.json
 # edit config.json with your credentials
 ```
 
-| Key | Required | Description |
-|-----|----------|-------------|
-| `csfloat_api_key` | Yes | CSFloat API key |
-| `steam_id64` | Yes | Your SteamID64 (17-digit number) |
-| `steam_login` | Yes | Steam username |
-| `steam_password` | Yes | Steam password |
-| `shared_secret` | Yes | From `.maFile` — used for 2FA login |
-| `identity_secret` | Yes | From `.maFile` — used to confirm trade offers |
-| `steam_api_key` | No | Steam Web API key (improves offer fetching reliability) |
-| `client_proxy` | No | Proxy for CSFloat HTTP: `socks5://user:pass@host:port` |
-| `steam_use_proxy` | No | Apply the proxy to Steam requests too (default: `false`) |
-| `notif_interval_seconds` | No | Notification poll interval (default: `15`) |
-| `heartbeat_interval_seconds` | No | Heartbeat poll interval (default: `60`) |
-| `post_run_delay_seconds` | No | Delay before post-cycle re-check (default: `5`) |
+| `config.json` key | `.env` variable | Required | Description |
+|-------------------|-----------------|----------|-------------|
+| `csfloat_api_key` | `CSFLOAT_API_KEY` | Yes | CSFloat API key |
+| `steam_id64` | `STEAM_ID64` | Yes | Your SteamID64 (17-digit number) |
+| `steam_login` | `STEAM_LOGIN` | Yes | Steam username |
+| `steam_password` | `STEAM_PASSWORD` | Yes | Steam password |
+| `shared_secret` | `STEAM_SHARED_SECRET` | Yes | From `.maFile` — used for 2FA login |
+| `identity_secret` | `STEAM_IDENTITY_SECRET` | Yes | From `.maFile` — used to confirm trade offers |
+| `steam_api_key` | `STEAM_API_KEY` | No | Steam Web API key (improves offer fetching reliability) |
+| `client_proxy` | `CLIENT_PROXY` | No | Proxy for CSFloat HTTP: `socks5://user:pass@host:port` |
+| `steam_use_proxy` | `STEAM_USE_PROXY` | No | Apply the proxy to Steam requests too (default: `false`) |
+| `notif_interval_seconds` | `NOTIF_INTERVAL_SECONDS` | No | Notification poll interval (default: `15`) |
+| `heartbeat_interval_seconds` | `HEARTBEAT_INTERVAL_SECONDS` | No | Heartbeat poll interval (default: `60`) |
+| `post_run_delay_seconds` | `POST_RUN_DELAY_SECONDS` | No | Delay before post-cycle re-check (default: `5`) |
 
 ## Usage
 
@@ -135,7 +184,10 @@ src/
     steam_trader.py       — Steam client wrapper (login, inventory, send offer, confirm)
     processor.py          — trade lifecycle orchestration + fast notification polling loop
 requirements.txt
-config.example.json
+config.example.json       — JSON config template
+.env.example              — environment-variable config template (used by Docker)
+Dockerfile                — container image definition
+docker-compose.yml        — one-command run with persistent Steam session + auto-restart
 ```
 
 ## Credits
