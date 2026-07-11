@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -16,7 +17,7 @@ import aiohttp
 from aiosteampy import SteamClient, TradeOfferStatus
 from aiosteampy.constants import AppContext
 from aiosteampy.exceptions import LoginError
-from aiosteampy.models import EconItem, ItemDescription
+from aiosteampy.models import BaseTradeOfferItem, EconItem, ItemDescription
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +36,74 @@ def _patched_set_d_id(self: ItemDescription) -> None:
                 object.__setattr__(self, "d_id", int(parts[1]))
 
 ItemDescription._set_d_id = _patched_set_d_id  # type: ignore[method-assign]
+
+# ---------------------------------------------------------------------------
+# Monkey-patch aiosteampy's tradable-after date parsing.  The library only
+# accepts "Jul 18, 2026 (23:59:59) GMT", but Steam also returns a short,
+# year-less form such as "18 Jul @ 12:00am" for trade-protected items, which
+# crashes the entire inventory fetch with ValueError.  Try all known formats
+# and, if none match, log a warning and leave tradable_after as None instead
+# of raising.
+# ---------------------------------------------------------------------------
+
+_TRADABLE_AFTER_FORMATS = (
+    "%b %d, %Y (%H:%M:%S) %Z",  # "Jul 18, 2026 (23:59:59) GMT" — library default
+    "%d %b, %Y @ %I:%M%p",      # "18 Jul, 2026 @ 12:00am"
+    "%b %d, %Y @ %I:%M%p",      # "Jul 18, 2026 @ 12:00am"
+    "%d %b @ %I:%M%p",          # "18 Jul @ 12:00am" — Steam omits the year
+    "%b %d @ %I:%M%p",          # "Jul 18 @ 12:00am"
+)
+
+_TRADE_RESTRICTION_PREFIXES = (
+    "Tradable/Marketable After ",
+    "This item is trade-protected and cannot be consumed, modified, or transferred until ",
+)
+
+
+def _parse_tradable_after(date_string: str) -> datetime | None:
+    date_string = date_string.strip()
+    for fmt in _TRADABLE_AFTER_FORMATS:
+        try:
+            parsed = datetime.strptime(date_string, fmt)
+        except ValueError:
+            continue
+        if parsed.year == 1900:
+            # Year-less format: unlock dates are always ahead of us, so pick
+            # the current year unless that lands well in the past (Dec→Jan
+            # rollover), then use next year.
+            now = datetime.utcnow()
+            parsed = parsed.replace(year=now.year)
+            if parsed < now - timedelta(days=7):
+                parsed = parsed.replace(year=now.year + 1)
+        return parsed
+    return None
+
+
+def _patched_set_tradable_after(self: EconItem) -> None:
+    description = self.description
+    if description is None or not description.market_tradable_restriction:
+        return
+    for prefix in _TRADE_RESTRICTION_PREFIXES:
+        descr = next(
+            filter(lambda d: prefix in d.value, description.owner_descriptions or ()),
+            None,
+        )
+        if descr is None:
+            continue
+        date_string = descr.value.split(prefix)[1]
+        parsed = _parse_tradable_after(date_string)
+        if parsed is None:
+            log.warning(
+                "Unrecognised tradable-after date %r on asset %s — treating as unknown",
+                date_string, self.asset_id,
+            )
+        else:
+            self.tradable_after = parsed
+        return
+
+
+EconItem._set_tradable_after = _patched_set_tradable_after  # type: ignore[method-assign]
+BaseTradeOfferItem._set_tradable_after = _patched_set_tradable_after  # type: ignore[method-assign]
 
 _CS2 = AppContext.CS2
 _STEAMID64_BASE = 76561197960265728
