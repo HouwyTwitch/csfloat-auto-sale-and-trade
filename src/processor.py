@@ -27,7 +27,7 @@ from typing import Any
 
 from aiosteampy import TradeOfferStatus
 
-from .csfloat_client import CSFloatClient
+from .csfloat_client import CSFloatClient, offer_already_sent
 from .steam_trader import SteamTrader
 
 log = logging.getLogger(__name__)
@@ -105,23 +105,39 @@ class TradeProcessor:
         # ---- Step 2: accept unaccepted trades on CSFloat ----
         unaccepted = [t for t in trades if not t.get("accepted_at")]
         if unaccepted:
-            await self._accept_trades(unaccepted)
-            # Give CSFloat a moment to persist the acceptance
-            await asyncio.sleep(4)
-            # Re-fetch so we see the updated accepted_at timestamps
-            try:
-                trades = await self._cf.get_sell_trades(self._my_id)
-            except Exception as exc:
-                log.error("Re-fetch after accept failed: %s", exc)
-                return
+            # CSFloat echoes the accepted trades back as full records — use
+            # them directly instead of depending on an immediate re-fetch.
+            by_id = {str(t["id"]): t for t in trades}
+            for t in await self._accept_trades(unaccepted):
+                if str(t.get("id")) in by_id and t.get("accepted_at"):
+                    by_id[str(t["id"])] = t
+            trades = list(by_id.values())
+
+            if any(not t.get("accepted_at") for t in trades):
+                # Give CSFloat a moment to persist the acceptance
+                await asyncio.sleep(4)
+                # Re-fetch so we see the updated accepted_at timestamps
+                try:
+                    trades = await self._cf.get_sell_trades(self._my_id)
+                except Exception as exc:
+                    log.error(
+                        "Re-fetch after accept failed: %s — continuing with known accepted trades",
+                        exc,
+                    )
 
         # ---- Step 3: send Steam offers for accepted trades ----
         accepted = [
             t for t in trades
-            if t.get("accepted_at") and not t.get("verify_sale_at")
+            if t.get("accepted_at")
+            and not t.get("verify_sale_at")
+            and not offer_already_sent(t)
         ]
         if not accepted:
-            log.info("No accepted-but-unverified trades to process.")
+            log.info("No accepted trades awaiting a Steam offer.")
+            return
+
+        accepted = await self._with_trade_details(accepted)
+        if not accepted:
             return
 
         plans = _build_offer_plans(accepted)
@@ -143,16 +159,20 @@ class TradeProcessor:
     # Accept helpers
     # ------------------------------------------------------------------
 
-    async def _accept_trades(self, trades: list[dict]) -> None:
-        """Bulk-accept a list of CSFloat trades with retry logic."""
+    async def _accept_trades(self, trades: list[dict]) -> list[dict]:
+        """
+        Bulk-accept a list of CSFloat trades with retry logic.
+
+        Returns the accepted trade records CSFloat reported back (may be empty).
+        """
         ids = [str(t["id"]) for t in trades]
         log.info("Accepting %d trade(s): %s", len(ids), ids)
 
         for attempt in range(1, 6):
-            ok = await self._cf.bulk_accept(ids)
-            if ok:
+            accepted = await self._cf.bulk_accept(ids)
+            if accepted is not None:
                 log.info("Bulk accept succeeded.")
-                return
+                return accepted
 
             log.warning("Bulk accept attempt %d failed, retrying…", attempt)
             await asyncio.sleep(4 * attempt)
@@ -165,9 +185,33 @@ class TradeProcessor:
             ids = [str(t["id"]) for t in fresh if not t.get("accepted_at")]
             if not ids:
                 log.info("All trades now accepted (concurrent update).")
-                return
+                return fresh
 
         log.error("Could not accept all trades after multiple attempts.")
+        return []
+
+    async def _with_trade_details(self, trades: list[dict]) -> list[dict]:
+        """
+        Return *trades* as full CSFloat records.
+
+        Slim listings omit ``trade_url`` / ``trade_token``, which are needed to
+        send the Steam offer, so those trades are fetched individually.
+        """
+        full: list[dict] = []
+        for trade in trades:
+            if trade.get("trade_url") or trade.get("trade_token"):
+                full.append(trade)
+                continue
+            try:
+                detail = await self._cf.get_trade(trade["id"])
+            except Exception as exc:
+                log.error("Could not fetch details for trade %s — skipping: %s", trade["id"], exc)
+                continue
+            if isinstance(detail, dict):
+                full.append(detail)
+            else:
+                log.error("Unexpected response for trade %s — skipping", trade["id"])
+        return full
 
     # ------------------------------------------------------------------
     # Offer execution helpers
