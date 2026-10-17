@@ -23,6 +23,8 @@ CSFloat has no public WebSocket or SSE stream. The bot uses two polling tiers so
 
 After each processing cycle the bot waits 5 s then runs one more cycle to catch any trades that arrived during processing.
 
+Each cycle lists open sales via `/api/v1/me/trades/slim` (the lightweight listing the CSFloat extension uses), then fetches `/api/v1/trades/{id}` only for trades that still need a Steam offer. If the slim endpoint is unavailable for your API key, the bot falls back to the full `/api/v1/me/trades` listing.
+
 ## Requirements
 
 - Steam mobile authenticator (`shared_secret` + `identity_secret` — from your `.maFile`)
