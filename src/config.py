@@ -18,7 +18,9 @@ Expected JSON structure (see config.example.json for a template):
     "user_agent": "Mozilla/5.0 ...",
     "notif_interval_seconds": 15,
     "heartbeat_interval_seconds": 60,
-    "post_run_delay_seconds": 5
+    "post_run_delay_seconds": 5,
+    "trade_state_interval_seconds": 180,
+    "report_extension_status": true
 }
 """
 
@@ -57,6 +59,8 @@ _ENV_MAP = {
     "NOTIF_INTERVAL_SECONDS": "notif_interval_seconds",
     "HEARTBEAT_INTERVAL_SECONDS": "heartbeat_interval_seconds",
     "POST_RUN_DELAY_SECONDS": "post_run_delay_seconds",
+    "TRADE_STATE_INTERVAL_SECONDS": "trade_state_interval_seconds",
+    "REPORT_EXTENSION_STATUS": "report_extension_status",
 }
 
 
@@ -106,12 +110,17 @@ def load(path: str | Path = "config.json") -> dict:
     cfg["steam_id64"] = int(cfg["steam_id64"])
 
     # Normalise numeric tuning knobs (env vars arrive as strings)
-    for key in ("notif_interval_seconds", "heartbeat_interval_seconds", "post_run_delay_seconds"):
+    for key in (
+        "notif_interval_seconds",
+        "heartbeat_interval_seconds",
+        "post_run_delay_seconds",
+        "trade_state_interval_seconds",
+    ):
         if key in cfg and cfg[key] is not None:
             cfg[key] = float(cfg[key])
 
     # Normalise boolean flags
-    for key in ("steam_use_proxy",):
+    for key in ("steam_use_proxy", "report_extension_status"):
         if key in cfg:
             cfg[key] = _to_bool(cfg[key])
 

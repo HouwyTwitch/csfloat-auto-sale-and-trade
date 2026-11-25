@@ -24,5 +24,9 @@ env/
 .DS_Store
 Thumbs.db
 
+# Logs (contain buyer Steam IDs and, in older versions, tokens)
+*.log
+*.log.*
+
 # State files
 processed_trades.json

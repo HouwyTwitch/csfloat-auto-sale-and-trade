@@ -5,7 +5,7 @@ This module contains:
   - TradeProcessor: the main business-logic class that ties CSFloat and Steam
     together, performing the full sale lifecycle.
   - NotificationPoller: a fast async polling loop that uses CSFloat's
-    /me/notifications endpoint as a pseudo-push mechanism (falls back to
+    /me/notifications/timeline endpoint as a pseudo-push mechanism (falls back to
     /me for the actionable_trades count).
 
 Full lifecycle per trade:
@@ -27,8 +27,14 @@ from typing import Any
 
 from aiosteampy import TradeOfferStatus
 
-from .csfloat_client import CSFloatClient, offer_already_sent
-from .steam_trader import SteamTrader
+from .csfloat_client import (
+    TRADE_STATE_ACTIVE,
+    TRADE_STATE_NEEDS_CONFIRMATION,
+    CSFloatClient,
+    offer_already_sent,
+)
+from .steam_trader import SteamTrader, redact_secrets
+from .trade_state import select_stale_unconfirmed_offer_ids
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +70,10 @@ class TradeProcessor:
         csfloat:    Authenticated CSFloatClient.
         steam:      Authenticated SteamTrader (must already be logged in).
         my_steam_id: The seller's SteamID64.
+        defer_stale_unconfirmed: Leave offers that CSFloat has seen waiting
+                    for mobile confirmation for over an hour to the trade-state
+                    sync, which cancels them like the CSFloat extension.  Set
+                    when the sync is enabled; otherwise such offers are confirmed.
     """
 
     def __init__(
@@ -71,10 +81,12 @@ class TradeProcessor:
         csfloat: CSFloatClient,
         steam: SteamTrader,
         my_steam_id: int,
+        defer_stale_unconfirmed: bool = False,
     ) -> None:
         self._cf = csfloat
         self._st = steam
         self._my_id = my_steam_id
+        self._defer_stale = defer_stale_unconfirmed
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -136,6 +148,8 @@ class TradeProcessor:
             log.info("No accepted trades awaiting a Steam offer.")
             return
 
+        stale_ids = set(select_stale_unconfirmed_offer_ids(accepted)) if self._defer_stale else set()
+
         accepted = await self._with_trade_details(accepted)
         if not accepted:
             return
@@ -147,11 +161,16 @@ class TradeProcessor:
         try:
             existing_offers = await self._st.get_active_sent_offers()
         except Exception as exc:
-            log.warning("Could not fetch existing Steam offers: %s", exc)
-            existing_offers = []
+            # Without the list we can't tell whether an offer already exists for
+            # these trades; sending anyway could create a duplicate offer.
+            log.error(
+                "Could not fetch existing Steam offers (%s) — not sending offers this cycle, will retry.",
+                redact_secrets(exc),
+            )
+            return
 
         for plan in plans:
-            await self._execute_plan(plan, existing_offers)
+            await self._execute_plan(plan, existing_offers, stale_ids)
 
         log.info("=== Processing cycle complete ===")
 
@@ -221,24 +240,50 @@ class TradeProcessor:
         self,
         plan: OfferPlan,
         existing_offers: list,
+        stale_ids: set[str] = frozenset(),
     ) -> None:
         """Send and confirm one Steam trade offer according to an OfferPlan."""
 
-        # --- Check if we already sent an offer for these items ---
+        # --- Reuse an offer that already exists on Steam for these items ---
+        # The trade only reaches this point when CSFloat does not track a live
+        # offer for it, so an existing offer still needs confirming and/or
+        # reporting to CSFloat.
         already_sent_id = _find_existing_offer(plan, existing_offers)
         if already_sent_id is not None:
             offer = next((o for o in existing_offers if o.trade_offer_id == already_sent_id), None)
-            if offer and offer.status == TradeOfferStatus.CONFIRMATION_NEED:
+            status = offer.status if offer else None
+            if status == TradeOfferStatus.CONFIRMATION_NEED and str(already_sent_id) in stale_ids:
+                log.warning(
+                    "Offer %s: CSFloat has seen it waiting for confirmation for over an hour — "
+                    "not confirming; the trade-state sync cancels it, like the CSFloat extension.",
+                    already_sent_id,
+                )
+            elif status == TradeOfferStatus.CONFIRMATION_NEED:
                 log.info(
                     "Offer %s already sent but needs confirmation — confirming now.",
                     already_sent_id,
                 )
-                await self._st.confirm_offer(already_sent_id)
+                confirmed = await self._st.confirm_offer(already_sent_id)
+                if confirmed:
+                    # confirm_offer also returns True when Steam lists no
+                    # confirmation for the offer; check what Steam says now.
+                    state = await self._st.get_sent_offer_state(already_sent_id)
+                    confirmed = state != TRADE_STATE_NEEDS_CONFIRMATION
+                if confirmed:
+                    await self._ping_offer_to_csfloat(str(already_sent_id), plan, offer=offer)
+                else:
+                    log.warning("Offer %s still unconfirmed — will retry next cycle.", already_sent_id)
+            elif status == TradeOfferStatus.ACTIVE:
+                log.info(
+                    "Offer %s is live on Steam but CSFloat doesn't track it — notifying CSFloat.",
+                    already_sent_id,
+                )
+                await self._ping_offer_to_csfloat(str(already_sent_id), plan, offer=offer)
             else:
                 log.info(
-                    "Offer for buyer %s already active (offer_id=%s) — skipping.",
-                    plan.buyer_id,
-                    already_sent_id,
+                    "Offer %s for buyer %s already accepted — the trade-state sync reports it "
+                    "to CSFloat via trade history.",
+                    already_sent_id, plan.buyer_id,
                 )
             return
 
@@ -276,36 +321,56 @@ class TradeProcessor:
                 offer_id,
             )
             await self._st.confirm_all_pending()
+            confirmed = await self._st.get_sent_offer_state(offer_id) == TRADE_STATE_ACTIVE
 
-        # --- Notify CSFloat that the offer has been sent and confirmed ---
-        # Mirrors what the CSFloat browser extension does: annotate the offer so
-        # CSFloat can link this Steam offer_id to its own trade record, then
-        # report its current state (Active = 2) so CSFloat knows it's live.
-        await self._ping_offer_to_csfloat(offer_id, plan)
+        # --- Notify CSFloat about the offer and its real state ---
+        # Mirrors the CSFloat extension: annotate the offer so CSFloat links the
+        # Steam offer_id to its trade record, then report its state — Active if
+        # confirmed, otherwise NeedsConfirmation so the next cycle retries it.
+        if not confirmed:
+            log.warning("Offer %s still needs mobile confirmation — will retry next cycle.", offer_id)
+        await self._ping_offer_to_csfloat(
+            offer_id,
+            plan,
+            state=TRADE_STATE_ACTIVE if confirmed else TRADE_STATE_NEEDS_CONFIRMATION,
+        )
 
 
-    async def _ping_offer_to_csfloat(self, offer_id: str, plan: OfferPlan) -> None:
+    async def _ping_offer_to_csfloat(
+        self,
+        offer_id: str,
+        plan: OfferPlan,
+        *,
+        offer: Any = None,
+        state: int = TRADE_STATE_ACTIVE,
+    ) -> None:
         """
-        Tell CSFloat about the Steam offer we just sent & confirmed.
+        Tell CSFloat about a Steam offer for *plan*.
 
         Two calls, matching the CSFloat browser extension behaviour:
           1. annotate_offer  — links the Steam offer_id to CSFloat's trade record
                                by matching the given_asset_ids.
-          2. ping_offer_status — reports the offer's current state (Active = 2)
-                                 so CSFloat knows it is live and awaiting the buyer.
+          2. ping_offer_status — reports the offer's current *state*.
+
+        *offer* (an existing SentOffer) supplies the real item list and
+        creation time; otherwise the plan's items and "now" are used.
         """
+        given = [i.asset_id for i in offer.items_to_give] if offer and offer.items_to_give else plan.asset_ids
+        created = getattr(offer, "time_created", None)
         ok1 = await self._cf.annotate_offer(
             offer_id=offer_id,
-            given_asset_ids=plan.asset_ids,
+            given_asset_ids=given,
             buyer_steam_id64=plan.buyer_id,
         )
         ok2 = await self._cf.ping_offer_status(
             offer_id=offer_id,
-            given_asset_ids=plan.asset_ids,
+            given_asset_ids=given,
             buyer_steam_id64=plan.buyer_id,
+            time_created=int(created.timestamp()) if created else None,
+            state=state,
         )
         if ok1 and ok2:
-            log.info("CSFloat notified: offer %s linked and status reported.", offer_id)
+            log.info("CSFloat notified: offer %s linked and status %s reported.", offer_id, state)
         else:
             log.warning(
                 "CSFloat notification partial failure for offer %s "
@@ -325,9 +390,11 @@ class NotificationPoller:
     Strategy (fastest practical approach without an official push API):
 
     1. **Notification poll** (every ``notif_interval`` seconds, default 15 s):
-       Hits ``/api/v1/me/notifications`` — a lightweight endpoint that often
-       reflects new trades before they appear in ``/me/trades``.  When a new
-       trade-related notification is detected the processor runs immediately.
+       Hits ``/api/v1/me/notifications/timeline`` — a lightweight endpoint
+       that often reflects new trades before they appear in ``/me/trades``.
+       When a new sale notification (``sold_contract``) shows up the processor
+       runs immediately.  Notifications present at startup are a baseline and
+       don't trigger (the startup cycle handles those trades anyway).
 
     2. **Heartbeat poll** (every ``heartbeat_interval`` seconds, default 60 s):
        Hits ``/api/v1/me`` and checks ``actionable_trades > 0`` as a safety net
@@ -338,14 +405,26 @@ class NotificationPoller:
        trades arrived while the previous batch was being handled.
     """
 
-    # Notification types that indicate a new trade is waiting
+    # Notification types that indicate a new trade is waiting.  "sold_contract"
+    # is CSFloat's current "Your X Has Been Sold — please send a trade offer";
+    # the rest are older names kept as substring matches.
     TRADE_NOTIF_TYPES = {
+        "sold_contract",
         "new_sale",
         "trade_accepted",
         "trade_queued",
         "new_trade",
         "offer_received",
         "sale_accepted",
+    }
+
+    # Informational types that need no action from the bot (never trigger,
+    # even if their text mentions a trade).
+    INFO_NOTIF_TYPES = {
+        "verifying_trade_soon",
+        "seller_verified_trade",
+        "offer_added",
+        "stripe_withdrawal",
     }
 
     def __init__(
@@ -365,6 +444,7 @@ class NotificationPoller:
         # OrderedDict preserves insertion order so we can evict oldest entries
         self._seen_notif_ids: OrderedDict[Any, None] = OrderedDict()
         self._last_heartbeat: float = 0.0
+        self._notif_failing = False
 
     async def run(self) -> None:
         """
@@ -377,6 +457,10 @@ class NotificationPoller:
             self._heartbeat_interval,
         )
 
+        # Baseline: everything already in the timeline is handled by the
+        # startup cycle below, so only notifications after this point trigger.
+        await self._check_notifications()
+
         # Initial run on startup to handle any trades that arrived while offline
         await self._safe_run()
 
@@ -384,33 +468,8 @@ class NotificationPoller:
             await asyncio.sleep(self._notif_interval)
             now = time.monotonic()
 
-            triggered = False
-
             # --- Notification check ---
-            try:
-                notifs = await self._cf.get_notifications()
-                new_trade_notifs = [
-                    n for n in notifs
-                    if n.get("id") not in self._seen_notif_ids
-                    and self._is_trade_notif(n)
-                ]
-                # Mark all as seen (OrderedDict preserves insertion order)
-                for n in notifs:
-                    nid = n.get("id")
-                    if nid not in self._seen_notif_ids:
-                        self._seen_notif_ids[nid] = None
-                # Evict oldest entries to bound memory (FIFO)
-                while len(self._seen_notif_ids) > 2000:
-                    self._seen_notif_ids.popitem(last=False)
-
-                if new_trade_notifs:
-                    log.info(
-                        "Notification trigger: %d new trade notification(s) detected.",
-                        len(new_trade_notifs),
-                    )
-                    triggered = True
-            except Exception as exc:
-                log.debug("Notification poll failed (will rely on heartbeat): %s", exc)
+            triggered = await self._check_notifications()
 
             # --- Heartbeat check (fallback) ---
             if not triggered and (now - self._last_heartbeat) >= self._heartbeat_interval:
@@ -435,6 +494,59 @@ class NotificationPoller:
                 await asyncio.sleep(self._post_run_delay)
                 await self._safe_run()
 
+    async def _check_notifications(self) -> bool:
+        """
+        Poll the notification timeline; True if a new sale notification arrived
+        since the previous poll.  The first successful poll only records a
+        baseline.  Failures are logged (once as a warning) and return False —
+        the /me heartbeat keeps the bot working without notifications.
+        """
+        try:
+            notifs = await self._cf.get_notifications()
+        except Exception as exc:
+            if not self._notif_failing:
+                log.warning(
+                    "Notification poll failed: %s — relying on the /me heartbeat every %.0fs "
+                    "until it works again.",
+                    exc, self._heartbeat_interval,
+                )
+                self._notif_failing = True
+            else:
+                log.debug("Notification poll still failing: %s", exc)
+            return False
+
+        if self._notif_failing:
+            log.info("Notification poll working again.")
+            self._notif_failing = False
+
+        baseline = not self._seen_notif_ids
+        new_trade_notifs = []
+        for n in notifs:
+            key = _notif_key(n)
+            if key in self._seen_notif_ids:
+                continue
+            self._seen_notif_ids[key] = None
+            if not baseline and self._is_trade_notif(n):
+                new_trade_notifs.append(n)
+        if baseline and not self._seen_notif_ids:
+            # Empty timeline: remember that the baseline was taken.
+            self._seen_notif_ids[None] = None
+        # Evict oldest entries to bound memory (FIFO)
+        while len(self._seen_notif_ids) > 2000:
+            self._seen_notif_ids.popitem(last=False)
+
+        if baseline:
+            log.info("Notification poll OK — %d notification(s) in timeline (baseline).", len(notifs))
+            return False
+        if new_trade_notifs:
+            log.info(
+                "Notification trigger: %d new sale notification(s): %s",
+                len(new_trade_notifs),
+                [n.get("title") or n.get("type") for n in new_trade_notifs],
+            )
+            return True
+        return False
+
     async def _safe_run(self) -> None:
         """Run one processor cycle, catching all exceptions."""
         try:
@@ -445,6 +557,8 @@ class NotificationPoller:
     def _is_trade_notif(self, notif: dict) -> bool:
         """Return True if this notification indicates a new pending trade."""
         ntype = str(notif.get("type", "")).lower()
+        if ntype in self.INFO_NOTIF_TYPES:
+            return False
         # Match any type that contains a known keyword
         for keyword in self.TRADE_NOTIF_TYPES:
             if keyword in ntype:
@@ -457,6 +571,14 @@ class NotificationPoller:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _notif_key(notif: dict) -> Any:
+    """Stable identity of a notification (id, else type + timestamp)."""
+    nid = notif.get("id") or notif.get("notification_id")
+    if nid:
+        return str(nid)
+    return (notif.get("type"), notif.get("created_at"), notif.get("title"))
+
 
 def _build_offer_plans(accepted_trades: list[dict]) -> list[OfferPlan]:
     """
