@@ -33,7 +33,7 @@ from .csfloat_client import (
     CSFloatClient,
     offer_already_sent,
 )
-from .steam_trader import SteamTrader
+from .steam_trader import SteamTrader, redact_secrets
 from .trade_state import select_stale_unconfirmed_offer_ids
 
 log = logging.getLogger(__name__)
@@ -161,8 +161,13 @@ class TradeProcessor:
         try:
             existing_offers = await self._st.get_active_sent_offers()
         except Exception as exc:
-            log.warning("Could not fetch existing Steam offers: %s", exc)
-            existing_offers = []
+            # Without the list we can't tell whether an offer already exists for
+            # these trades; sending anyway could create a duplicate offer.
+            log.error(
+                "Could not fetch existing Steam offers (%s) — not sending offers this cycle, will retry.",
+                redact_secrets(exc),
+            )
+            return
 
         for plan in plans:
             await self._execute_plan(plan, existing_offers, stale_ids)
@@ -258,7 +263,13 @@ class TradeProcessor:
                     "Offer %s already sent but needs confirmation — confirming now.",
                     already_sent_id,
                 )
-                if await self._st.confirm_offer(already_sent_id):
+                confirmed = await self._st.confirm_offer(already_sent_id)
+                if confirmed:
+                    # confirm_offer also returns True when Steam lists no
+                    # confirmation for the offer; check what Steam says now.
+                    state = await self._st.get_sent_offer_state(already_sent_id)
+                    confirmed = state != TRADE_STATE_NEEDS_CONFIRMATION
+                if confirmed:
                     await self._ping_offer_to_csfloat(str(already_sent_id), plan, offer=offer)
                 else:
                     log.warning("Offer %s still unconfirmed — will retry next cycle.", already_sent_id)

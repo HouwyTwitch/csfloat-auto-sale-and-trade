@@ -70,6 +70,11 @@ class CSFloatAPIError(Exception):
         self.body = body
 
 
+# Failures the best-effort report / annotate calls swallow (returning False):
+# an HTTP error from CSFloat, or a network error that outlived the retries.
+_REPORT_ERRORS = (CSFloatAPIError, aiohttp.ClientError, asyncio.TimeoutError)
+
+
 class CSFloatClient:
     """
     Thin async wrapper around the CSFloat REST API.
@@ -361,7 +366,7 @@ class CSFloatClient:
                 label=f"annotate_offer({offer_id})",
             )
             return True
-        except CSFloatAPIError as exc:
+        except _REPORT_ERRORS as exc:
             log.warning("annotate_offer(%s) failed: %s", offer_id, exc)
             return False
 
@@ -406,7 +411,7 @@ class CSFloatClient:
         try:
             await self._request("POST", URL_STEAM_STATUS_OFFER, json=payload, label=label)
             return True
-        except CSFloatAPIError as exc:
+        except _REPORT_ERRORS as exc:
             log.warning("%s failed: %s", label, exc)
             return False
 
@@ -429,7 +434,7 @@ class CSFloatClient:
                 label="report_trade_history",
             )
             return True
-        except CSFloatAPIError as exc:
+        except _REPORT_ERRORS as exc:
             log.warning("report_trade_history failed: %s", exc)
             return False
 
@@ -449,7 +454,7 @@ class CSFloatClient:
                 label=f"cancel_ping({trade_id})",
             )
             return True
-        except CSFloatAPIError as exc:
+        except _REPORT_ERRORS as exc:
             log.warning("cancel_ping(%s) failed: %s", trade_id, exc)
             return False
 
@@ -469,7 +474,7 @@ class CSFloatClient:
                 label=f"report_rollback({trade_id})",
             )
             return True
-        except CSFloatAPIError as exc:
+        except _REPORT_ERRORS as exc:
             log.warning("report_rollback(%s) failed: %s", trade_id, exc)
             return False
 
@@ -488,7 +493,7 @@ class CSFloatClient:
                 label="report_blocked_users",
             )
             return True
-        except CSFloatAPIError as exc:
+        except _REPORT_ERRORS as exc:
             log.warning("report_blocked_users failed: %s", exc)
             return False
 
@@ -516,7 +521,7 @@ class CSFloatClient:
         try:
             await self._request("POST", URL_EXTENSION_STATUS, json=payload, label="ping_extension_status")
             return True
-        except CSFloatAPIError as exc:
+        except _REPORT_ERRORS as exc:
             log.warning("ping_extension_status failed: %s", exc)
             return False
 
