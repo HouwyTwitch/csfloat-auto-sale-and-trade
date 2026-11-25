@@ -29,7 +29,8 @@ log = logging.getLogger(__name__)
 _BASE = "https://csfloat.com/api/v1"
 
 URL_ME                   = f"{_BASE}/me"
-URL_NOTIFICATIONS        = f"{_BASE}/me/notifications"
+URL_NOTIFICATIONS_TIMELINE = f"{_BASE}/me/notifications/timeline"
+URL_NOTIFICATIONS        = f"{_BASE}/me/notifications"  # legacy, replaced by /timeline
 URL_TRADES               = f"{_BASE}/me/trades"
 URL_TRADES_SLIM          = f"{_BASE}/me/trades/slim"
 URL_TRADE                = f"{_BASE}/trades/{{trade_id}}"
@@ -109,6 +110,9 @@ class CSFloatClient:
         self._trace = trace_requests
         self._timeout = aiohttp.ClientTimeout(total=timeout, sock_read=timeout / 2)
         self._slim_available = True
+        # Notification endpoints still to try, newest first; one that answers
+        # 404/405 is dropped for the rest of the run.
+        self._notif_urls = [URL_NOTIFICATIONS_TIMELINE, URL_NOTIFICATIONS]
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -200,26 +204,46 @@ class CSFloatClient:
 
     async def get_notifications(self) -> list[dict]:
         """
-        Fetch the latest notifications list.
+        Fetch the latest notifications, newest first.
 
         CSFloat does not expose a WebSocket / SSE stream publicly, so we poll
         this lightweight endpoint every few seconds as a push-notification proxy.
         It typically reflects new trades faster than polling ``/me/trades``.
+
+        Uses ``/me/notifications/timeline`` (what csfloat.com calls since late
+        Nov 2026; returns ``{"data": [...], "cursor", "latest_notification_id"}``
+        with ``notification_id`` per item), falling back to the legacy
+        ``/me/notifications`` if the timeline route doesn't exist.  Each item
+        gets an ``id`` key (copied from ``notification_id``) for the poller.
+
+        Raises CSFloatAPIError when no notification endpoint is available or
+        the request is rejected; the caller relies on the ``/me`` heartbeat then.
         """
-        try:
-            data = await self._request(
-                "GET",
-                URL_NOTIFICATIONS,
-                params={"limit": "50"},
-                label="get_notifications",
-            )
-            return data if isinstance(data, list) else data.get("data", [])
-        except CSFloatAPIError as exc:
-            # Notifications endpoint may not be available on all accounts
-            if exc.status == 404:
-                log.debug("Notifications endpoint not available, falling back to /me polling")
-                return []
-            raise
+        while self._notif_urls:
+            url = self._notif_urls[0]
+            try:
+                if url == URL_NOTIFICATIONS:
+                    data = await self._request("GET", url, params={"limit": "50"}, label="get_notifications")
+                else:
+                    data = await self._request("GET", url, label="get_notifications")
+            except CSFloatAPIError as exc:
+                if exc.status in (404, 405) and len(self._notif_urls) > 1:
+                    log.warning(
+                        "Notifications endpoint %s not available (HTTP %d) — trying %s",
+                        url, exc.status, self._notif_urls[1],
+                    )
+                    self._notif_urls.pop(0)
+                    continue
+                raise
+            items = data if isinstance(data, list) else (data or {}).get("data") or []
+            out = []
+            for n in items:
+                if isinstance(n, dict):
+                    n = dict(n)
+                    n.setdefault("id", n.get("notification_id"))
+                    out.append(n)
+            return out
+        raise CSFloatAPIError(404, "no notifications endpoint available")
 
     async def get_sell_trades(
         self,

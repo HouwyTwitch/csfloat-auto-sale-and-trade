@@ -19,7 +19,7 @@ CSFloat has no public WebSocket or SSE stream. The bot uses two polling tiers so
 
 | Tier | Endpoint | Default interval | Purpose |
 |------|----------|-----------------|---------|
-| Notification poll | `/api/v1/me/notifications` | **15 s** | Fastest signal — typically reflects new trades within seconds |
+| Notification poll | `/api/v1/me/notifications/timeline` | **15 s** | Fastest signal — a new `sold_contract` notification triggers a cycle within seconds |
 | Heartbeat poll | `/api/v1/me` | **60 s** | Safety net — catches anything the notification tier missed |
 
 After each processing cycle the bot waits 5 s then runs one more cycle to catch any trades that arrived during processing.
