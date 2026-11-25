@@ -7,8 +7,9 @@ Handles all communication with the CSFloat API:
  - Fetching a single full trade (trade URL / token for sending the offer)
  - Bulk-accepting trades
  - Reporting Steam trade / offer state back to CSFloat (``steam-status``,
-   ``cancel-ping``, ``rollback``) — the same reports the CSFloat mobile app
-   sends from its background trade-state sync.
+   ``cancel-ping``, ``rollback``, blocked users, extension status) — the same
+   requests the CSFloat browser extension (5.19.2) sends from its background
+   trade-tracking alarm.
 """
 
 from __future__ import annotations
@@ -39,6 +40,8 @@ URL_STEAM_STATUS_NEW_OFFER = f"{_BASE}/trades/steam-status/new-offer"
 URL_STEAM_STATUS_HISTORY = f"{_BASE}/trades/steam-status/trade-history"
 URL_TRADE_CANCEL_PING    = f"{_BASE}/trades/{{trade_id}}/cancel-ping"
 URL_TRADE_ROLLBACK       = f"{_BASE}/trades/{{trade_id}}/rollback"
+URL_STEAM_STATUS_BLOCKED = f"{_BASE}/trades/steam-status/blocked-users"
+URL_EXTENSION_STATUS     = f"{_BASE}/me/extension/status"
 
 # Steam TradeOfferState enum values
 TRADE_STATE_ACTIVE = 2
@@ -48,10 +51,9 @@ TRADE_STATE_ACCEPTED = 3
 # (as opposed to 2 = scraped from HTML).
 STATUS_SOURCE_API = 1
 
-# ``origin`` field of steam-status reports (CSFloat: EXTENSION = 1,
-# MOBILE = 2).  The bot is a desktop-side client that talks to the Steam Web
-# API, like the browser extension, so it identifies as such.
-REPORT_ORIGIN = 1
+# ``origin`` of rollback reports (RollbackOrigin.EXTENSION in the extension).
+# The bot reads Steam through the Web API like the extension does.
+ROLLBACK_ORIGIN_EXTENSION = 1
 
 # Statuses on the slim endpoint that mean "not available for this auth method"
 # — fall back to the full /me/trades listing instead.
@@ -339,18 +341,17 @@ class CSFloatClient:
         """
         Link a Steam trade offer to CSFloat's internal trade records.
 
-        Equivalent to what the CSFloat extension / mobile app do via
-        POST /api/v1/trades/steam-status/new-offer when they detect an offer
-        sent outside of them (i.e. sent by this bot).
-
-        *buyer_steam_id64* is kept for call-site compatibility; the app's
-        payload carries only the offer id and asset ids.
+        Equivalent to the extension's ``AnnotateOffer``
+        (POST /api/v1/trades/steam-status/new-offer), which it sends for offers
+        created outside of CSFloat's site (i.e. sent by this bot).
         """
-        payload = {
+        payload: dict[str, Any] = {
             "offer_id": str(offer_id),
             "given_asset_ids": [str(a) for a in given_asset_ids],
             "received_asset_ids": [str(a) for a in received_asset_ids or ()],
         }
+        if buyer_steam_id64:
+            payload["other_steam_id64"] = str(buyer_steam_id64)
         try:
             await self._request(
                 "POST",
@@ -385,7 +386,7 @@ class CSFloatClient:
             "received_asset_ids": [],
             "time_created": time_created or now,
             "time_updated": now,
-            "other_steamid64": str(buyer_steam_id64),
+            "other_steam_id64": str(buyer_steam_id64),
         }
         return await self.report_offer_states([offer], label=f"ping_offer_status({offer_id})")
 
@@ -393,13 +394,13 @@ class CSFloatClient:
         """
         POST /trades/steam-status/offer with Steam offer states.
 
-        Each offer uses the mobile app's shape: ``offer_id``, ``state``,
-        ``given_asset_ids``, ``received_asset_ids``, ``time_created``,
-        ``time_updated``, ``other_steamid64``.
+        Each offer uses the extension's ``OfferStatus`` shape: ``offer_id``,
+        ``state``, ``given_asset_ids``, ``received_asset_ids``,
+        ``time_created``, ``time_updated``, ``other_steam_id64``.
         """
         if not offers:
             return True
-        payload = {"sent_offers": offers, "type": STATUS_SOURCE_API, "origin": REPORT_ORIGIN}
+        payload = {"sent_offers": offers, "type": STATUS_SOURCE_API}
         try:
             await self._request("POST", URL_STEAM_STATUS_OFFER, json=payload, label=label)
             return True
@@ -417,7 +418,7 @@ class CSFloatClient:
         """
         if not history:
             return True
-        payload = {"history": history, "type": STATUS_SOURCE_API, "origin": REPORT_ORIGIN}
+        payload = {"history": history, "type": STATUS_SOURCE_API}
         try:
             await self._request(
                 "POST",
@@ -430,16 +431,19 @@ class CSFloatClient:
             log.warning("report_trade_history failed: %s", exc)
             return False
 
-    async def cancel_ping(self, trade_id: str | int) -> bool:
+    async def cancel_ping(self, trade_id: str | int, steam_id: str | None = None) -> bool:
         """
         POST /trades/{id}/cancel-ping — confirm that no live Steam offer exists
         for a trade the counter-party asked to cancel (``wait_for_cancel_ping``).
+
+        *steam_id* is the account the Steam data was read from (the extension
+        sends the SteamID of its Web API token).
         """
         try:
             await self._request(
                 "POST",
                 URL_TRADE_CANCEL_PING.format(trade_id=trade_id),
-                json={},
+                json={"steam_id": str(steam_id)} if steam_id else {},
                 label=f"cancel_ping({trade_id})",
             )
             return True
@@ -452,7 +456,7 @@ class CSFloatClient:
         POST /trades/{id}/rollback — report that the Steam trade for a CSFloat
         trade was reversed under Steam's trade protection.
         """
-        payload: dict[str, Any] = {"origin": REPORT_ORIGIN}
+        payload: dict[str, Any] = {"origin": ROLLBACK_ORIGIN_EXTENSION}
         if rollback_trade_id:
             payload["rollback_trade_id"] = str(rollback_trade_id)
         try:
@@ -465,6 +469,53 @@ class CSFloatClient:
             return True
         except CSFloatAPIError as exc:
             log.warning("report_rollback(%s) failed: %s", trade_id, exc)
+            return False
+
+    async def report_blocked_users(self, blocked_steam_ids: list[str]) -> bool:
+        """
+        POST /trades/steam-status/blocked-users — counter-parties of pending
+        trades that are on our Steam block list (they can't receive offers).
+        """
+        if not blocked_steam_ids:
+            return True
+        try:
+            await self._request(
+                "POST",
+                URL_STEAM_STATUS_BLOCKED,
+                json={"blocked_steam_ids": [str(i) for i in blocked_steam_ids]},
+                label="report_blocked_users",
+            )
+            return True
+        except CSFloatAPIError as exc:
+            log.warning("report_blocked_users failed: %s", exc)
+            return False
+
+    async def ping_extension_status(
+        self,
+        *,
+        version: str,
+        access_token_steam_id: str = "",
+        history_error: str = "",
+        trade_offer_error: str = "",
+    ) -> bool:
+        """
+        POST /me/extension/status — the trade-tracking health report the
+        extension sends after every run: Steam access, which account the Web
+        API token belongs to, and the last history / offer fetch errors.
+        """
+        payload = {
+            "steam_community_permission": True,
+            "steam_powered_permission": True,
+            "version": version,
+            "access_token_steam_id": access_token_steam_id or "",
+            "history_error": history_error or "",
+            "trade_offer_error": trade_offer_error or "",
+        }
+        try:
+            await self._request("POST", URL_EXTENSION_STATUS, json=payload, label="ping_extension_status")
+            return True
+        except CSFloatAPIError as exc:
+            log.warning("ping_extension_status failed: %s", exc)
             return False
 
 

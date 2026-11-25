@@ -19,7 +19,8 @@ Expected JSON structure (see config.example.json for a template):
     "notif_interval_seconds": 15,
     "heartbeat_interval_seconds": 60,
     "post_run_delay_seconds": 5,
-    "trade_state_interval_seconds": 270
+    "trade_state_interval_seconds": 180,
+    "report_extension_status": true
 }
 """
 
@@ -59,6 +60,7 @@ _ENV_MAP = {
     "HEARTBEAT_INTERVAL_SECONDS": "heartbeat_interval_seconds",
     "POST_RUN_DELAY_SECONDS": "post_run_delay_seconds",
     "TRADE_STATE_INTERVAL_SECONDS": "trade_state_interval_seconds",
+    "REPORT_EXTENSION_STATUS": "report_extension_status",
 }
 
 
@@ -118,7 +120,7 @@ def load(path: str | Path = "config.json") -> dict:
             cfg[key] = float(cfg[key])
 
     # Normalise boolean flags
-    for key in ("steam_use_proxy",):
+    for key in ("steam_use_proxy", "report_extension_status"):
         if key in cfg:
             cfg[key] = _to_bool(cfg[key])
 

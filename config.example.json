@@ -21,5 +21,6 @@
     "notif_interval_seconds": 15,
     "heartbeat_interval_seconds": 60,
     "post_run_delay_seconds": 5,
-    "trade_state_interval_seconds": 270
+    "trade_state_interval_seconds": 180,
+    "report_extension_status": true
 }

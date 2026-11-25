@@ -228,7 +228,15 @@ class TradeProcessor:
         already_sent_id = _find_existing_offer(plan, existing_offers)
         if already_sent_id is not None:
             offer = next((o for o in existing_offers if o.trade_offer_id == already_sent_id), None)
-            if offer and offer.status == TradeOfferStatus.CONFIRMATION_NEED:
+            if offer and offer.status == TradeOfferStatus.CONFIRMATION_NEED and _is_stale(offer):
+                # The CSFloat extension cancels offers left unconfirmed for over
+                # an hour (the trade-state sync does the same); don't revive one.
+                log.warning(
+                    "Offer %s has waited for confirmation for over an hour — not confirming it "
+                    "(the trade-state sync cancels such offers, like the CSFloat extension).",
+                    already_sent_id,
+                )
+            elif offer and offer.status == TradeOfferStatus.CONFIRMATION_NEED:
                 log.info(
                     "Offer %s already sent but needs confirmation — confirming now.",
                     already_sent_id,
@@ -491,6 +499,15 @@ def _build_offer_plans(accepted_trades: list[dict]) -> list[OfferPlan]:
             groups[buyer_id].csfloat_trade_ids.append(trade_id)
 
     return list(groups.values())
+
+
+_STALE_CONFIRMATION_SECONDS = 60 * 60
+
+
+def _is_stale(offer: Any) -> bool:
+    """True if a Steam offer was created more than an hour ago."""
+    created = getattr(offer, "time_created", None)
+    return created is not None and created.timestamp() < time.time() - _STALE_CONFIRMATION_SECONDS
 
 
 def _find_existing_offer(plan: OfferPlan, sent_offers: list) -> int | None:

@@ -129,9 +129,9 @@ class SteamTradeStatus:
     TRADE_PROTECTION_ROLLBACK = 12
 
 
-# Trade-history statuses the CSFloat app reports.  ``Committed`` (trade done,
-# still inside Steam's trade-protection window) and ``Failed`` were added in
-# the Nov 2026 app update after Steam started returning them.
+# Trade-history statuses CSFloat's extension (5.19.2) and mobile app report.
+# ``Committed`` (trade done, still inside Steam's trade-protection window) and
+# ``Failed`` were added in the Nov 2026 updates.
 _REPORTED_TRADE_STATUSES = frozenset({
     SteamTradeStatus.COMMITTED,
     SteamTradeStatus.COMPLETE,
@@ -140,12 +140,14 @@ _REPORTED_TRADE_STATUSES = frozenset({
 })
 
 _CS2_APPID = 730
-_TRADE_HISTORY_MAX = 250  # same page size the CSFloat app requests
+_TRADE_HISTORY_MAX = 250  # MAX_TRADE_HISTORY_FETCH in the CSFloat extension
 
 # Steam Web API calls made by the background trade-state sync use a smaller
 # retry budget than the offer-sending path so one flaky sync cannot stall for
 # minutes; the next sync simply tries again.
 _SYNC_RETRY_ATTEMPTS = 2
+
+_BLOCKED_STEAMID_RE = re.compile(r'class=".+?ignored.+?".*?id=".+?".*?data-steamid="(7656\d+)"', re.S)
 
 _SECRET_QUERY_RE = re.compile(r"((?:access_token|key)=)[^&\s'\"]+", re.IGNORECASE)
 
@@ -171,6 +173,7 @@ class SentOffer:
     partner_id: int
     status: TradeOfferStatus
     items_to_give: list[_OfferItem] = field(default_factory=list)
+    time_created: datetime | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +457,7 @@ class SteamTrader:
                     partner_id=offer.partner_id,
                     status=offer.status,
                     items_to_give=items,
+                    time_created=getattr(offer, "time_created", None),
                 ))
             except Exception as exc:
                 log.warning("Skipping malformed offer entry: %s", redact_secrets(exc))
@@ -461,16 +465,18 @@ class SteamTrader:
         return result
 
     # ------------------------------------------------------------------
-    # Trade-state sync (raw Web API data, shaped like the CSFloat app)
+    # Trade-state sync (raw Web API data, shaped like the CSFloat extension)
     # ------------------------------------------------------------------
 
     async def _ensure_access_token(self) -> None:
         """
         Make sure the ``steamLoginSecure`` access token is still valid.
 
-        The CSFloat app now reads its Web API token from this same cookie
-        (Steam removed the ``data-loyalty_webapi_token`` page attribute it used
-        to scrape); aiosteampy has always used the cookie.
+        Steam removed the ``data-loyalty_webapi_token`` attribute that
+        CSFloat's clients used to scrape from steamcommunity.com.  The
+        extension now asks the store (``pointssummary/ajaxgetasyncconfig``) and
+        the mobile app reads the ``steamLoginSecure`` cookie; aiosteampy has
+        always used that cookie, so the bot needs no change here.
         """
         if not self._client.is_access_token_expired:
             return
@@ -495,7 +501,7 @@ class SteamTrader:
     async def get_trade_history_entries(self, max_trades: int = _TRADE_HISTORY_MAX) -> list[dict]:
         """
         Fetch recent Steam trades (``IEconService/GetTradeHistory``) and map
-        them exactly like the CSFloat app's ``getTradeHistoryFromAPI``:
+        them exactly like the CSFloat extension's ``getTradeHistoryFromAPI``:
 
         * only Committed / Complete / Failed / TradeProtectionRollback trades,
         * skip trades still in escrow,
@@ -541,7 +547,7 @@ class SteamTrader:
     async def get_offer_states(self) -> dict[str, list[dict]]:
         """
         Fetch sent and received offers (``IEconService/GetTradeOffers``) mapped
-        like the CSFloat app's ``offerStateMapper``.
+        like the CSFloat extension's ``offerStateMapper``.
 
         Returns ``{"sent": [...], "received": [...]}``.
         """
@@ -559,6 +565,53 @@ class SteamTrader:
             "sent": [_map_offer_state(o) for o in response.get("trade_offers_sent") or []],
             "received": [_map_offer_state(o) for o in response.get("trade_offers_received") or []],
         }
+
+    async def access_token_steam_id(self) -> str:
+        """
+        SteamID64 the Web API token belongs to (refreshing it if expired), or
+        "" if no valid token can be obtained — the extension's
+        ``getAccessToken().steam_id``.
+        """
+        try:
+            await self._ensure_access_token()
+            if self._client.is_access_token_expired:
+                return ""
+            return str((self._client.access_token_decoded or {}).get("sub") or "")
+        except Exception as exc:
+            log.warning("Could not obtain a Steam Web API token: %s", redact_secrets(exc))
+            return ""
+
+    async def cancel_trade_offer(self, offer_id: str | int) -> bool:
+        """Cancel one of our sent trade offers (``/tradeoffer/{id}/cancel``)."""
+        try:
+            await _retry(
+                lambda: self._client.cancel_trade_offer(int(offer_id)),
+                label=f"cancel_trade_offer({offer_id})",
+                max_attempts=_SYNC_RETRY_ATTEMPTS,
+                reauth_fn=self._client.login,
+            )
+            return True
+        except Exception as exc:
+            log.error("Failed to cancel trade offer %s: %s", offer_id, redact_secrets(exc))
+            return False
+
+    async def fetch_blocked_steam_ids(self) -> list[str]:
+        """
+        SteamID64s on our Steam block list — scraped from
+        ``/profiles/{id}/friends/blocked?ajax=1`` like the extension's
+        ``FetchBlockedUsers``.
+        """
+        url = STEAM_URL.COMMUNITY / f"profiles/{self._steam_id}/friends/blocked"
+
+        async def fetch() -> str:
+            r = await self._client.session.get(url, params={"ajax": "1", "l": "english"})
+            r.raise_for_status()
+            return await r.text()
+
+        text = await _retry(fetch, label="fetch_blocked_users", max_attempts=_SYNC_RETRY_ATTEMPTS)
+        if "blocked" not in text.lower():
+            raise RuntimeError("failed to parse blocked users page (not logged in?)")
+        return _BLOCKED_STEAMID_RE.findall(text)
 
     @property
     def steam_id(self) -> int:
@@ -586,7 +639,8 @@ def _map_offer_state(o: dict) -> dict:
         "received_asset_ids": [i.get("assetid") for i in o.get("items_to_receive") or ()],
         "time_created": o.get("time_created"),
         "time_updated": o.get("time_updated"),
-        "other_steamid64": str(_STEAMID64_BASE + int(account_id)) if account_id is not None else None,
+        # Extension spelling (the mobile app uses "other_steamid64").
+        "other_steam_id64": str(_STEAMID64_BASE + int(account_id)) if account_id is not None else None,
     }
 
 

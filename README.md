@@ -11,7 +11,7 @@ Async Python bot that fully automates the CS2 seller flow on [CSFloat](https://c
 | 3 | Send Steam trade offer to the buyer |
 | 4 | Confirm via Steam Guard (mobile authenticator) |
 | 5 | Notify CSFloat via steam-status API (mirrors the browser extension) |
-| 6 | Keep CSFloat in sync with Steam in the background — trade history, offer states, rollbacks, cancel pings (mirrors the CSFloat mobile app) |
+| 6 | Keep CSFloat in sync with Steam in the background — trade history, offer states, rollbacks, cancel pings, blocked buyers (mirrors the CSFloat browser extension 5.19.2) |
 
 ## How polling works
 
@@ -28,21 +28,26 @@ Each cycle lists open sales via `/api/v1/me/trades/slim` (the lightweight listin
 
 ## Trade-state sync (how sales get verified)
 
-Every 4.5 minutes (same cadence as the CSFloat mobile app) the bot reads your
-Steam trade history and trade offers through the Steam Web API and reports
-anything CSFloat doesn't know yet:
+Every 3 minutes (same cadence as the CSFloat browser extension's trade-tracking
+alarm) the bot reads your Steam trade history and trade offers through the
+Steam Web API and reports anything CSFloat doesn't know yet:
 
 | Report | Endpoint | When |
 |--------|----------|------|
+| Blocked buyers | `/api/v1/trades/steam-status/blocked-users` | A buyer/seller of a pending trade is on your Steam block list (checked every 10 min) |
 | Trade history | `/api/v1/trades/steam-status/trade-history` | A Steam trade (Committed / Complete / Failed / rolled back) touches a pending CSFloat trade |
 | Offer state | `/api/v1/trades/steam-status/offer` | A linked offer changed state (accepted, declined, expired, …) |
 | Link offer | `/api/v1/trades/steam-status/new-offer` | An active offer gives away a pending trade's item but CSFloat hasn't linked it |
 | Rollback | `/api/v1/trades/{id}/rollback` | Steam reversed the trade under trade protection |
 | Cancel ping | `/api/v1/trades/{id}/cancel-ping` | The buyer asked to cancel and no live Steam offer exists |
+| Status | `/api/v1/me/extension/status` | After every run: token SteamID and last Steam errors (`REPORT_EXTENSION_STATUS=false` to skip) |
+
+Like the extension, it also cancels your offers that CSFloat has seen waiting
+for mobile confirmation for over an hour.
 
 The Nov 2026 Steam change added the `Committed` trade status (trade done, still
-inside Steam's trade-protection window); it is included. The app's TLSNotary
-proofs are not reproduced — they need its native prover. Set
+inside Steam's trade-protection window); it is included. The extension's
+TLSNotary proofs are not reproduced — they need its WASM prover. Set
 `TRADE_STATE_INTERVAL_SECONDS=0` to turn the sync off.
 
 ## Requirements
@@ -141,7 +146,8 @@ cp config.example.json config.json
 | `notif_interval_seconds` | `NOTIF_INTERVAL_SECONDS` | No | Notification poll interval (default: `15`) |
 | `heartbeat_interval_seconds` | `HEARTBEAT_INTERVAL_SECONDS` | No | Heartbeat poll interval (default: `60`) |
 | `post_run_delay_seconds` | `POST_RUN_DELAY_SECONDS` | No | Delay before post-cycle re-check (default: `5`) |
-| `trade_state_interval_seconds` | `TRADE_STATE_INTERVAL_SECONDS` | No | Steam → CSFloat trade-state sync interval (default: `270`, `0` = off) |
+| `trade_state_interval_seconds` | `TRADE_STATE_INTERVAL_SECONDS` | No | Steam → CSFloat trade-state sync interval (default: `180`, `0` = off) |
+| `report_extension_status` | `REPORT_EXTENSION_STATUS` | No | Send the extension status ping after each sync (default: `true`) |
 
 ## Usage
 
@@ -206,7 +212,7 @@ src/
     csfloat_client.py     — CSFloat REST API client (polling, accept, steam-status notify)
     steam_trader.py       — Steam client wrapper (login, inventory, send offer, confirm)
     processor.py          — trade lifecycle orchestration + fast notification polling loop
-    trade_state.py        — background Steam → CSFloat trade-state sync (mirrors the mobile app)
+    trade_state.py        — background Steam → CSFloat trade tracking (mirrors the browser extension)
 requirements.txt
 config.example.json       — JSON config template
 .env.example              — environment-variable config template (used by Docker)

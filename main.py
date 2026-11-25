@@ -123,12 +123,13 @@ async def amain(
                 post_run_delay=float(cfg.get("post_run_delay_seconds", 5)),
             )
 
-            # Background Steam → CSFloat trade-state sync, like the CSFloat app.
+            # Background Steam → CSFloat trade tracking, like the CSFloat extension.
             reporter = TradeStateReporter(
                 csfloat=csfloat,
                 steam=steam,
                 my_steam_id=cfg["steam_id64"],
                 interval=float(cfg.get("trade_state_interval_seconds", TRADE_STATE_DEFAULT_INTERVAL)),
+                report_status=cfg.get("report_extension_status", True),
             )
 
             async with asyncio.TaskGroup() as tg:
