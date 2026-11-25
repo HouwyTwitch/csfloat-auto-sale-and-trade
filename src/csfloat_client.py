@@ -46,6 +46,7 @@ URL_EXTENSION_STATUS     = f"{_BASE}/me/extension/status"
 # Steam TradeOfferState enum values
 TRADE_STATE_ACTIVE = 2
 TRADE_STATE_ACCEPTED = 3
+TRADE_STATE_NEEDS_CONFIRMATION = 9
 
 # ``type`` field of steam-status reports: data came from the Steam Web API
 # (as opposed to 2 = scraped from HTML).
@@ -367,21 +368,22 @@ class CSFloatClient:
     async def ping_offer_status(
         self,
         offer_id: str,
-        given_asset_ids: list[int],
+        given_asset_ids: list[int | str],
         buyer_steam_id64: int,
         time_created: int | None = None,
+        state: int = TRADE_STATE_ACTIVE,
     ) -> bool:
         """
-        Report the current status of a sent Steam trade offer to CSFloat.
+        Report the current status of a sent Steam trade offer to CSFloat
+        (POST /api/v1/trades/steam-status/offer).
 
-        Equivalent to what the CSFloat extension does via
-        POST /api/v1/trades/steam-status/offer after confirming an offer.
-        Reports state=2 (Active) — the offer is confirmed and awaiting buyer acceptance.
+        *state* defaults to 2 (Active: confirmed, awaiting the buyer); pass 9
+        (NeedsConfirmation) when mobile confirmation hasn't gone through.
         """
         now = int(time.time())
         offer = {
             "offer_id": str(offer_id),
-            "state": TRADE_STATE_ACTIVE,
+            "state": state,
             "given_asset_ids": [str(a) for a in given_asset_ids],
             "received_asset_ids": [],
             "time_created": time_created or now,

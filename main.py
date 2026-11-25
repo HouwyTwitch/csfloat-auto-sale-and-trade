@@ -109,10 +109,14 @@ async def amain(
         )
 
         async with SteamTrader.from_config(cfg, cookie_path) as steam:
+            trade_state_interval = float(
+                cfg.get("trade_state_interval_seconds", TRADE_STATE_DEFAULT_INTERVAL)
+            )
             processor = TradeProcessor(
                 csfloat=csfloat,
                 steam=steam,
                 my_steam_id=cfg["steam_id64"],
+                defer_stale_unconfirmed=trade_state_interval > 0,
             )
 
             poller = NotificationPoller(
@@ -128,7 +132,7 @@ async def amain(
                 csfloat=csfloat,
                 steam=steam,
                 my_steam_id=cfg["steam_id64"],
-                interval=float(cfg.get("trade_state_interval_seconds", TRADE_STATE_DEFAULT_INTERVAL)),
+                interval=trade_state_interval,
                 report_status=cfg.get("report_extension_status", True),
             )
 

@@ -566,6 +566,18 @@ class SteamTrader:
             "received": [_map_offer_state(o) for o in response.get("trade_offers_received") or []],
         }
 
+    async def get_sent_offer_state(self, offer_id: str | int) -> int | None:
+        """Current Steam state of one of our sent offers, or None if unknown."""
+        try:
+            offers = await self.get_offer_states()
+        except Exception as exc:
+            log.warning("Could not check state of offer %s: %s", offer_id, redact_secrets(exc))
+            return None
+        return next(
+            (o.get("state") for o in offers["sent"] if str(o.get("offer_id")) == str(offer_id)),
+            None,
+        )
+
     async def access_token_steam_id(self) -> str:
         """
         SteamID64 the Web API token belongs to (refreshing it if expired), or

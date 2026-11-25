@@ -27,8 +27,14 @@ from typing import Any
 
 from aiosteampy import TradeOfferStatus
 
-from .csfloat_client import CSFloatClient, offer_already_sent
+from .csfloat_client import (
+    TRADE_STATE_ACTIVE,
+    TRADE_STATE_NEEDS_CONFIRMATION,
+    CSFloatClient,
+    offer_already_sent,
+)
 from .steam_trader import SteamTrader
+from .trade_state import select_stale_unconfirmed_offer_ids
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +70,10 @@ class TradeProcessor:
         csfloat:    Authenticated CSFloatClient.
         steam:      Authenticated SteamTrader (must already be logged in).
         my_steam_id: The seller's SteamID64.
+        defer_stale_unconfirmed: Leave offers that CSFloat has seen waiting
+                    for mobile confirmation for over an hour to the trade-state
+                    sync, which cancels them like the CSFloat extension.  Set
+                    when the sync is enabled; otherwise such offers are confirmed.
     """
 
     def __init__(
@@ -71,10 +81,12 @@ class TradeProcessor:
         csfloat: CSFloatClient,
         steam: SteamTrader,
         my_steam_id: int,
+        defer_stale_unconfirmed: bool = False,
     ) -> None:
         self._cf = csfloat
         self._st = steam
         self._my_id = my_steam_id
+        self._defer_stale = defer_stale_unconfirmed
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -136,6 +148,8 @@ class TradeProcessor:
             log.info("No accepted trades awaiting a Steam offer.")
             return
 
+        stale_ids = set(select_stale_unconfirmed_offer_ids(accepted)) if self._defer_stale else set()
+
         accepted = await self._with_trade_details(accepted)
         if not accepted:
             return
@@ -151,7 +165,7 @@ class TradeProcessor:
             existing_offers = []
 
         for plan in plans:
-            await self._execute_plan(plan, existing_offers)
+            await self._execute_plan(plan, existing_offers, stale_ids)
 
         log.info("=== Processing cycle complete ===")
 
@@ -221,32 +235,44 @@ class TradeProcessor:
         self,
         plan: OfferPlan,
         existing_offers: list,
+        stale_ids: set[str] = frozenset(),
     ) -> None:
         """Send and confirm one Steam trade offer according to an OfferPlan."""
 
-        # --- Check if we already sent an offer for these items ---
+        # --- Reuse an offer that already exists on Steam for these items ---
+        # The trade only reaches this point when CSFloat does not track a live
+        # offer for it, so an existing offer still needs confirming and/or
+        # reporting to CSFloat.
         already_sent_id = _find_existing_offer(plan, existing_offers)
         if already_sent_id is not None:
             offer = next((o for o in existing_offers if o.trade_offer_id == already_sent_id), None)
-            if offer and offer.status == TradeOfferStatus.CONFIRMATION_NEED and _is_stale(offer):
-                # The CSFloat extension cancels offers left unconfirmed for over
-                # an hour (the trade-state sync does the same); don't revive one.
+            status = offer.status if offer else None
+            if status == TradeOfferStatus.CONFIRMATION_NEED and str(already_sent_id) in stale_ids:
                 log.warning(
-                    "Offer %s has waited for confirmation for over an hour — not confirming it "
-                    "(the trade-state sync cancels such offers, like the CSFloat extension).",
+                    "Offer %s: CSFloat has seen it waiting for confirmation for over an hour — "
+                    "not confirming; the trade-state sync cancels it, like the CSFloat extension.",
                     already_sent_id,
                 )
-            elif offer and offer.status == TradeOfferStatus.CONFIRMATION_NEED:
+            elif status == TradeOfferStatus.CONFIRMATION_NEED:
                 log.info(
                     "Offer %s already sent but needs confirmation — confirming now.",
                     already_sent_id,
                 )
-                await self._st.confirm_offer(already_sent_id)
+                if await self._st.confirm_offer(already_sent_id):
+                    await self._ping_offer_to_csfloat(str(already_sent_id), plan, offer=offer)
+                else:
+                    log.warning("Offer %s still unconfirmed — will retry next cycle.", already_sent_id)
+            elif status == TradeOfferStatus.ACTIVE:
+                log.info(
+                    "Offer %s is live on Steam but CSFloat doesn't track it — notifying CSFloat.",
+                    already_sent_id,
+                )
+                await self._ping_offer_to_csfloat(str(already_sent_id), plan, offer=offer)
             else:
                 log.info(
-                    "Offer for buyer %s already active (offer_id=%s) — skipping.",
-                    plan.buyer_id,
-                    already_sent_id,
+                    "Offer %s for buyer %s already accepted — the trade-state sync reports it "
+                    "to CSFloat via trade history.",
+                    already_sent_id, plan.buyer_id,
                 )
             return
 
@@ -284,36 +310,56 @@ class TradeProcessor:
                 offer_id,
             )
             await self._st.confirm_all_pending()
+            confirmed = await self._st.get_sent_offer_state(offer_id) == TRADE_STATE_ACTIVE
 
-        # --- Notify CSFloat that the offer has been sent and confirmed ---
-        # Mirrors what the CSFloat browser extension does: annotate the offer so
-        # CSFloat can link this Steam offer_id to its own trade record, then
-        # report its current state (Active = 2) so CSFloat knows it's live.
-        await self._ping_offer_to_csfloat(offer_id, plan)
+        # --- Notify CSFloat about the offer and its real state ---
+        # Mirrors the CSFloat extension: annotate the offer so CSFloat links the
+        # Steam offer_id to its trade record, then report its state — Active if
+        # confirmed, otherwise NeedsConfirmation so the next cycle retries it.
+        if not confirmed:
+            log.warning("Offer %s still needs mobile confirmation — will retry next cycle.", offer_id)
+        await self._ping_offer_to_csfloat(
+            offer_id,
+            plan,
+            state=TRADE_STATE_ACTIVE if confirmed else TRADE_STATE_NEEDS_CONFIRMATION,
+        )
 
 
-    async def _ping_offer_to_csfloat(self, offer_id: str, plan: OfferPlan) -> None:
+    async def _ping_offer_to_csfloat(
+        self,
+        offer_id: str,
+        plan: OfferPlan,
+        *,
+        offer: Any = None,
+        state: int = TRADE_STATE_ACTIVE,
+    ) -> None:
         """
-        Tell CSFloat about the Steam offer we just sent & confirmed.
+        Tell CSFloat about a Steam offer for *plan*.
 
         Two calls, matching the CSFloat browser extension behaviour:
           1. annotate_offer  — links the Steam offer_id to CSFloat's trade record
                                by matching the given_asset_ids.
-          2. ping_offer_status — reports the offer's current state (Active = 2)
-                                 so CSFloat knows it is live and awaiting the buyer.
+          2. ping_offer_status — reports the offer's current *state*.
+
+        *offer* (an existing SentOffer) supplies the real item list and
+        creation time; otherwise the plan's items and "now" are used.
         """
+        given = [i.asset_id for i in offer.items_to_give] if offer and offer.items_to_give else plan.asset_ids
+        created = getattr(offer, "time_created", None)
         ok1 = await self._cf.annotate_offer(
             offer_id=offer_id,
-            given_asset_ids=plan.asset_ids,
+            given_asset_ids=given,
             buyer_steam_id64=plan.buyer_id,
         )
         ok2 = await self._cf.ping_offer_status(
             offer_id=offer_id,
-            given_asset_ids=plan.asset_ids,
+            given_asset_ids=given,
             buyer_steam_id64=plan.buyer_id,
+            time_created=int(created.timestamp()) if created else None,
+            state=state,
         )
         if ok1 and ok2:
-            log.info("CSFloat notified: offer %s linked and status reported.", offer_id)
+            log.info("CSFloat notified: offer %s linked and status %s reported.", offer_id, state)
         else:
             log.warning(
                 "CSFloat notification partial failure for offer %s "
@@ -499,15 +545,6 @@ def _build_offer_plans(accepted_trades: list[dict]) -> list[OfferPlan]:
             groups[buyer_id].csfloat_trade_ids.append(trade_id)
 
     return list(groups.values())
-
-
-_STALE_CONFIRMATION_SECONDS = 60 * 60
-
-
-def _is_stale(offer: Any) -> bool:
-    """True if a Steam offer was created more than an hour ago."""
-    created = getattr(offer, "time_created", None)
-    return created is not None and created.timestamp() < time.time() - _STALE_CONFIRMATION_SECONDS
 
 
 def _find_existing_offer(plan: OfferPlan, sent_offers: list) -> int | None:
