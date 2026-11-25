@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -15,7 +17,7 @@ from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 from aiosteampy import SteamClient, TradeOfferStatus
-from aiosteampy.constants import AppContext
+from aiosteampy.constants import STEAM_URL, AppContext
 from aiosteampy.exceptions import LoginError
 from aiosteampy.models import BaseTradeOfferItem, EconItem, ItemDescription
 
@@ -110,6 +112,49 @@ _STEAMID64_BASE = 76561197960265728
 _KEEPALIVE_INTERVAL = 20 * 60  # check every 20 minutes
 
 
+class SteamTradeStatus:
+    """``status`` values of ``IEconService/GetTradeHistory`` trades (ETradeStatus)."""
+    INIT = 0
+    PRE_COMMITTED = 1
+    COMMITTED = 2
+    COMPLETE = 3
+    FAILED = 4
+    PARTIAL_SUPPORT_ROLLBACK = 5
+    FULL_SUPPORT_ROLLBACK = 6
+    SUPPORT_ROLLBACK_SELECTIVE = 7
+    ROLLBACK_FAILED = 8
+    ROLLBACK_ABANDONED = 9
+    IN_ESCROW = 10
+    ESCROW_ROLLBACK = 11
+    TRADE_PROTECTION_ROLLBACK = 12
+
+
+# Trade-history statuses the CSFloat app reports.  ``Committed`` (trade done,
+# still inside Steam's trade-protection window) and ``Failed`` were added in
+# the Nov 2026 app update after Steam started returning them.
+_REPORTED_TRADE_STATUSES = frozenset({
+    SteamTradeStatus.COMMITTED,
+    SteamTradeStatus.COMPLETE,
+    SteamTradeStatus.FAILED,
+    SteamTradeStatus.TRADE_PROTECTION_ROLLBACK,
+})
+
+_CS2_APPID = 730
+_TRADE_HISTORY_MAX = 250  # same page size the CSFloat app requests
+
+# Steam Web API calls made by the background trade-state sync use a smaller
+# retry budget than the offer-sending path so one flaky sync cannot stall for
+# minutes; the next sync simply tries again.
+_SYNC_RETRY_ATTEMPTS = 2
+
+_SECRET_QUERY_RE = re.compile(r"((?:access_token|key)=)[^&\s'\"]+", re.IGNORECASE)
+
+
+def redact_secrets(value: object) -> str:
+    """Mask ``access_token=`` / ``key=`` query values in an error message or URL."""
+    return _SECRET_QUERY_RE.sub(r"\1***", str(value))
+
+
 # ---------------------------------------------------------------------------
 # Lightweight adapter types so processor.py needs no changes
 # ---------------------------------------------------------------------------
@@ -182,7 +227,14 @@ class SteamTrader:
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> "SteamTrader":
-        await self._login()
+        try:
+            await self._login()
+        except BaseException:
+            # __aexit__ is not called when __aenter__ raises — close the
+            # session here so a failed login doesn't leak "Unclosed client
+            # session" errors.
+            await self._client.session.close()
+            raise
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         return self
 
@@ -218,7 +270,7 @@ class SteamTrader:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                log.error("Keep-alive: unexpected error: %s", exc)
+                log.error("Keep-alive: unexpected error: %s", redact_secrets(exc))
 
     # ------------------------------------------------------------------
     # Inventory
@@ -316,7 +368,7 @@ class SteamTrader:
                 reauth_fn=self._client.login,
             )
         except Exception as exc:
-            log.error("Failed to send trade offer to %s: %s", buyer_steam_id, exc)
+            log.error("Failed to send trade offer to %s: %s", buyer_steam_id, redact_secrets(exc))
             return None
 
         offer_id_str = str(offer_id)
@@ -353,10 +405,10 @@ class SteamTrader:
             )):
                 log.debug(
                     "Offer %s already confirmed (no pending confirmation found): %s",
-                    offer_id, exc,
+                    offer_id, redact_secrets(exc),
                 )
                 return True
-            log.error("Failed to confirm trade offer %s: %s", offer_id, exc)
+            log.error("Failed to confirm trade offer %s: %s", offer_id, redact_secrets(exc))
             return False
 
     async def confirm_all_pending(self) -> None:
@@ -373,7 +425,7 @@ class SteamTrader:
             )
             log.info("confirm_all_pending: all pending confirmations allowed")
         except Exception as exc:
-            log.error("confirm_all_pending error: %s", exc)
+            log.error("confirm_all_pending error: %s", redact_secrets(exc))
 
     async def get_active_sent_offers(self) -> list[SentOffer]:
         """
@@ -390,7 +442,7 @@ class SteamTrader:
                 reauth_fn=self._client.login,
             )
         except Exception as exc:
-            log.error("Failed to fetch sent trade offers: %s", exc)
+            log.error("Failed to fetch sent trade offers: %s", redact_secrets(exc))
             return []
 
         result: list[SentOffer] = []
@@ -404,9 +456,109 @@ class SteamTrader:
                     items_to_give=items,
                 ))
             except Exception as exc:
-                log.warning("Skipping malformed offer entry: %s", exc)
+                log.warning("Skipping malformed offer entry: %s", redact_secrets(exc))
 
         return result
+
+    # ------------------------------------------------------------------
+    # Trade-state sync (raw Web API data, shaped like the CSFloat app)
+    # ------------------------------------------------------------------
+
+    async def _ensure_access_token(self) -> None:
+        """
+        Make sure the ``steamLoginSecure`` access token is still valid.
+
+        The CSFloat app now reads its Web API token from this same cookie
+        (Steam removed the ``data-loyalty_webapi_token`` page attribute it used
+        to scrape); aiosteampy has always used the cookie.
+        """
+        if not self._client.is_access_token_expired:
+            return
+        log.info("Steam access token expired — refreshing")
+        try:
+            await self._client.refresh_access_token()
+        except Exception as exc:
+            log.warning("Access token refresh failed: %s", redact_secrets(exc))
+        if self._client.is_access_token_expired:
+            log.warning("Access token still expired — re-logging in")
+            await _retry(self._client.login, label="token_relogin")
+
+    async def _call_web_api(self, url, params: dict, label: str) -> dict:
+        await self._ensure_access_token()
+        return await _retry(
+            lambda: self._client.call_web_api(url, params=params),
+            label=label,
+            max_attempts=_SYNC_RETRY_ATTEMPTS,
+            reauth_fn=self._client.login,
+        )
+
+    async def get_trade_history_entries(self, max_trades: int = _TRADE_HISTORY_MAX) -> list[dict]:
+        """
+        Fetch recent Steam trades (``IEconService/GetTradeHistory``) and map
+        them exactly like the CSFloat app's ``getTradeHistoryFromAPI``:
+
+        * only Committed / Complete / Failed / TradeProtectionRollback trades,
+        * skip trades still in escrow,
+        * keep only CS2 assets, drop trades with none.
+        """
+        rj = await self._call_web_api(
+            STEAM_URL.API.IEconService.GetTradeHistory,
+            {
+                "max_trades": max_trades,
+                "include_failed": 1,
+                "get_descriptions": 0,
+            },
+            label="get_trade_history",
+        )
+        now = time.time()
+        entries: list[dict] = []
+        for t in (rj.get("response") or {}).get("trades") or []:
+            if t.get("status") not in _REPORTED_TRADE_STATUSES:
+                continue
+            escrow_end = t.get("time_escrow_end")
+            if escrow_end and int(escrow_end) >= now:
+                continue
+            received = _cs2_assets(t.get("assets_received"))
+            given = _cs2_assets(t.get("assets_given"))
+            if not received and not given:
+                continue
+            other = t.get("steamid_other")
+            entry = {
+                "other_party_url": f"https://steamcommunity.com/profiles/{other}",
+                "other_party_id": other,
+                "received_assets": received,
+                "given_assets": given,
+                "trade_id": t.get("tradeid"),
+                "time_settlement": t.get("time_settlement"),
+                "status": t.get("status"),
+                "rollback_trade": t.get("rollback_trade"),
+                "time_init": t.get("time_init"),
+            }
+            # JSON.stringify drops undefined fields — mirror that.
+            entries.append({k: v for k, v in entry.items() if v is not None})
+        return entries
+
+    async def get_offer_states(self) -> dict[str, list[dict]]:
+        """
+        Fetch sent and received offers (``IEconService/GetTradeOffers``) mapped
+        like the CSFloat app's ``offerStateMapper``.
+
+        Returns ``{"sent": [...], "received": [...]}``.
+        """
+        rj = await self._call_web_api(
+            STEAM_URL.API.IEconService.GetTradeOffers,
+            {
+                "get_sent_offers": 1,
+                "get_received_offers": 1,
+                "get_descriptions": 0,
+            },
+            label="get_offer_states",
+        )
+        response = rj.get("response") or {}
+        return {
+            "sent": [_map_offer_state(o) for o in response.get("trade_offers_sent") or []],
+            "received": [_map_offer_state(o) for o in response.get("trade_offers_received") or []],
+        }
 
     @property
     def steam_id(self) -> int:
@@ -416,6 +568,27 @@ class SteamTrader:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _cs2_assets(assets: list[dict] | None) -> list[dict]:
+    return [
+        {"asset_id": a.get("assetid"), "new_asset_id": a.get("new_assetid")}
+        for a in assets or ()
+        if int(a.get("appid", 0)) == _CS2_APPID
+    ]
+
+
+def _map_offer_state(o: dict) -> dict:
+    account_id = o.get("accountid_other")
+    return {
+        "offer_id": o.get("tradeofferid"),
+        "state": o.get("trade_offer_state"),
+        "given_asset_ids": [i.get("assetid") for i in o.get("items_to_give") or ()],
+        "received_asset_ids": [i.get("assetid") for i in o.get("items_to_receive") or ()],
+        "time_created": o.get("time_created"),
+        "time_updated": o.get("time_updated"),
+        "other_steamid64": str(_STEAMID64_BASE + int(account_id)) if account_id is not None else None,
+    }
+
 
 async def _retry(
     fn,
@@ -444,7 +617,7 @@ async def _retry(
                 if reauth_fn is None or attempt > max_attempts:
                     log.error(
                         "[%s] 401 Unauthorized — giving up (attempt %d/%d): %s",
-                        label, attempt, max_attempts + 1, exc,
+                        label, attempt, max_attempts + 1, redact_secrets(exc),
                     )
                     raise
                 log.warning(
@@ -454,18 +627,18 @@ async def _retry(
                 try:
                     await reauth_fn()
                 except Exception as reauth_exc:
-                    log.error("[%s] Re-auth failed: %s — giving up", label, reauth_exc)
+                    log.error("[%s] Re-auth failed: %s — giving up", label, redact_secrets(reauth_exc))
                     raise exc from reauth_exc
                 # Reset delay after a successful re-auth
                 delay = base_delay
                 continue
             # Other HTTP error codes: treat as transient
             if attempt > max_attempts:
-                log.error("[%s] Giving up after %d attempts: %s", label, attempt, exc)
+                log.error("[%s] Giving up after %d attempts: %s", label, attempt, redact_secrets(exc))
                 raise
             log.warning(
                 "[%s] Transient error (attempt %d/%d): %s — retrying in %.1fs",
-                label, attempt, max_attempts + 1, exc, delay,
+                label, attempt, max_attempts + 1, redact_secrets(exc), delay,
             )
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60.0)
@@ -476,11 +649,11 @@ async def _retry(
             TimeoutError,
         ) as exc:
             if attempt > max_attempts:
-                log.error("[%s] Giving up after %d attempts: %s", label, attempt, exc)
+                log.error("[%s] Giving up after %d attempts: %s", label, attempt, redact_secrets(exc))
                 raise
             log.warning(
                 "[%s] Transient error (attempt %d/%d): %s — retrying in %.1fs",
-                label, attempt, max_attempts + 1, exc, delay,
+                label, attempt, max_attempts + 1, redact_secrets(exc), delay,
             )
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60.0)

@@ -22,6 +22,7 @@ import argparse
 import asyncio
 import logging
 import logging.handlers
+import re
 import signal
 import sys
 from pathlib import Path
@@ -33,6 +34,8 @@ import src.config as cfg_module
 from src.csfloat_client import CSFloatClient
 from src.processor import NotificationPoller, TradeProcessor
 from src.steam_trader import SteamTrader
+from src.trade_state import DEFAULT_INTERVAL as TRADE_STATE_DEFAULT_INTERVAL
+from src.trade_state import TradeStateReporter
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -91,7 +94,7 @@ async def amain(
     proxy: str | None = cfg.get("client_proxy") or None
     if proxy:
         connector = ProxyConnector.from_url(proxy, ttl_dns_cache=300)
-        logging.getLogger(__name__).info("Using proxy for CSFloat HTTP: %s", proxy)
+        logging.getLogger(__name__).info("Using proxy for CSFloat HTTP: %s", _mask_proxy(proxy))
     else:
         connector = aiohttp.TCPConnector(
             resolver=aiohttp.resolver.AsyncResolver(),
@@ -120,7 +123,22 @@ async def amain(
                 post_run_delay=float(cfg.get("post_run_delay_seconds", 5)),
             )
 
-            await poller.run()
+            # Background Steam → CSFloat trade-state sync, like the CSFloat app.
+            reporter = TradeStateReporter(
+                csfloat=csfloat,
+                steam=steam,
+                my_steam_id=cfg["steam_id64"],
+                interval=float(cfg.get("trade_state_interval_seconds", TRADE_STATE_DEFAULT_INTERVAL)),
+            )
+
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(poller.run())
+                tg.create_task(reporter.run())
+
+
+def _mask_proxy(url: str) -> str:
+    """Hide the password in a proxy URL before logging it."""
+    return re.sub(r"(//[^:/@]+:)[^@/]+@", r"\1***@", url)
 
 
 def _resolve_path(raw: str) -> Path:

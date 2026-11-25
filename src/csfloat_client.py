@@ -6,6 +6,9 @@ Handles all communication with the CSFloat API:
  - Fetching pending / queued sell trades (slim listing, like the extension)
  - Fetching a single full trade (trade URL / token for sending the offer)
  - Bulk-accepting trades
+ - Reporting Steam trade / offer state back to CSFloat (``steam-status``,
+   ``cancel-ping``, ``rollback``) — the same reports the CSFloat mobile app
+   sends from its background trade-state sync.
 """
 
 from __future__ import annotations
@@ -33,10 +36,22 @@ URL_ACCEPT_BULK          = f"{_BASE}/trades/bulk/accept"
 URL_ACCEPT_ONE           = f"{_BASE}/trades/{{trade_id}}/accept"
 URL_STEAM_STATUS_OFFER   = f"{_BASE}/trades/steam-status/offer"
 URL_STEAM_STATUS_NEW_OFFER = f"{_BASE}/trades/steam-status/new-offer"
+URL_STEAM_STATUS_HISTORY = f"{_BASE}/trades/steam-status/trade-history"
+URL_TRADE_CANCEL_PING    = f"{_BASE}/trades/{{trade_id}}/cancel-ping"
+URL_TRADE_ROLLBACK       = f"{_BASE}/trades/{{trade_id}}/rollback"
 
 # Steam TradeOfferState enum values
 TRADE_STATE_ACTIVE = 2
 TRADE_STATE_ACCEPTED = 3
+
+# ``type`` field of steam-status reports: data came from the Steam Web API
+# (as opposed to 2 = scraped from HTML).
+STATUS_SOURCE_API = 1
+
+# ``origin`` field of steam-status reports (CSFloat: EXTENSION = 1,
+# MOBILE = 2).  The bot is a desktop-side client that talks to the Steam Web
+# API, like the browser extension, so it identifies as such.
+REPORT_ORIGIN = 1
 
 # Statuses on the slim endpoint that mean "not available for this auth method"
 # — fall back to the full /me/trades listing instead.
@@ -216,6 +231,27 @@ class CSFloatClient:
         Filters out trades with ``wait_for_cancel_ping=true`` (buyer-initiated
         cancellations) which must not be acted upon.
         """
+        trades = await self._list_trades(states, limit, role="seller", label="get_sell_trades")
+        return [t for t in trades if _is_actionable_sale(t, my_steam_id)]
+
+    async def get_pending_trades(self, limit: int = 5000) -> list[dict]:
+        """
+        Return *all* pending trades (as buyer or seller), unfiltered.
+
+        This is the listing the CSFloat mobile app feeds into its background
+        trade-state sync (``/me/trades/slim?state=pending&limit=5000``).
+        """
+        return await self._list_trades("pending", limit, role=None, label="get_pending_trades")
+
+    async def _list_trades(
+        self,
+        states: str,
+        limit: int,
+        *,
+        role: str | None,
+        label: str,
+    ) -> list[dict]:
+        """List trades via the slim endpoint, falling back to the full listing."""
         data = None
         if self._slim_available:
             try:
@@ -223,7 +259,7 @@ class CSFloatClient:
                     "GET",
                     URL_TRADES_SLIM,
                     params={"state": states, "limit": str(limit), "page": "0"},
-                    label="get_sell_trades",
+                    label=label,
                 )
             except CSFloatAPIError as exc:
                 if exc.status not in _SLIM_UNAVAILABLE:
@@ -235,21 +271,17 @@ class CSFloatClient:
                 self._slim_available = False
 
         if data is None:
-            data = await self._request(
-                "GET",
-                URL_TRADES,
-                params={
-                    "role": "seller",
-                    "state": states,
-                    "limit": str(limit),
-                    "exclude_wait_for_settlement": "false",
-                    "page": "0",
-                },
-                label="get_sell_trades",
-            )
+            params = {
+                "state": states,
+                "limit": str(limit),
+                "exclude_wait_for_settlement": "false",
+                "page": "0",
+            }
+            if role:
+                params["role"] = role
+            data = await self._request("GET", URL_TRADES, params=params, label=label)
 
-        trades: list[dict] = data.get("trades", []) if isinstance(data, dict) else []
-        return [t for t in trades if _is_actionable_sale(t, my_steam_id)]
+        return data.get("trades", []) if isinstance(data, dict) else []
 
     async def get_trade(self, trade_id: str | int) -> dict:
         """Return the full trade record (incl. ``trade_url`` / ``trade_token``)."""
@@ -300,21 +332,24 @@ class CSFloatClient:
     async def annotate_offer(
         self,
         offer_id: str,
-        given_asset_ids: list[int],
-        buyer_steam_id64: int,
+        given_asset_ids: list[int | str],
+        buyer_steam_id64: int | None = None,
+        received_asset_ids: list[int | str] | None = None,
     ) -> bool:
         """
         Link a Steam trade offer to CSFloat's internal trade records.
 
-        Equivalent to what the CSFloat browser extension does via
-        POST /api/v1/trades/steam-status/new-offer when it detects an offer
-        sent outside the extension (i.e. sent by this bot).
+        Equivalent to what the CSFloat extension / mobile app do via
+        POST /api/v1/trades/steam-status/new-offer when they detect an offer
+        sent outside of them (i.e. sent by this bot).
+
+        *buyer_steam_id64* is kept for call-site compatibility; the app's
+        payload carries only the offer id and asset ids.
         """
         payload = {
-            "offer_id": offer_id,
+            "offer_id": str(offer_id),
             "given_asset_ids": [str(a) for a in given_asset_ids],
-            "received_asset_ids": [],
-            "other_steam_id64": str(buyer_steam_id64),
+            "received_asset_ids": [str(a) for a in received_asset_ids or ()],
         }
         try:
             await self._request(
@@ -338,35 +373,98 @@ class CSFloatClient:
         """
         Report the current status of a sent Steam trade offer to CSFloat.
 
-        Equivalent to what the CSFloat browser extension does via
+        Equivalent to what the CSFloat extension does via
         POST /api/v1/trades/steam-status/offer after confirming an offer.
         Reports state=2 (Active) — the offer is confirmed and awaiting buyer acceptance.
         """
         now = int(time.time())
-        payload = {
-            "sent_offers": [
-                {
-                    "offer_id": offer_id,
-                    "state": TRADE_STATE_ACTIVE,
-                    "given_asset_ids": [str(a) for a in given_asset_ids],
-                    "received_asset_ids": [],
-                    "time_created": time_created or now,
-                    "time_updated": now,
-                    "other_steam_id64": str(buyer_steam_id64),
-                }
-            ],
-            "type": 1,  # 1 = API source (vs 2 = HTML scrape)
+        offer = {
+            "offer_id": str(offer_id),
+            "state": TRADE_STATE_ACTIVE,
+            "given_asset_ids": [str(a) for a in given_asset_ids],
+            "received_asset_ids": [],
+            "time_created": time_created or now,
+            "time_updated": now,
+            "other_steamid64": str(buyer_steam_id64),
         }
+        return await self.report_offer_states([offer], label=f"ping_offer_status({offer_id})")
+
+    async def report_offer_states(self, offers: list[dict], *, label: str = "report_offer_states") -> bool:
+        """
+        POST /trades/steam-status/offer with Steam offer states.
+
+        Each offer uses the mobile app's shape: ``offer_id``, ``state``,
+        ``given_asset_ids``, ``received_asset_ids``, ``time_created``,
+        ``time_updated``, ``other_steamid64``.
+        """
+        if not offers:
+            return True
+        payload = {"sent_offers": offers, "type": STATUS_SOURCE_API, "origin": REPORT_ORIGIN}
+        try:
+            await self._request("POST", URL_STEAM_STATUS_OFFER, json=payload, label=label)
+            return True
+        except CSFloatAPIError as exc:
+            log.warning("%s failed: %s", label, exc)
+            return False
+
+    async def report_trade_history(self, history: list[dict]) -> bool:
+        """
+        POST /trades/steam-status/trade-history with Steam trade-history entries.
+
+        This is how the extension / mobile app tell CSFloat that a sale's
+        Steam trade actually went through (or failed / was rolled back), which
+        is what CSFloat verifies the sale against.
+        """
+        if not history:
+            return True
+        payload = {"history": history, "type": STATUS_SOURCE_API, "origin": REPORT_ORIGIN}
         try:
             await self._request(
                 "POST",
-                URL_STEAM_STATUS_OFFER,
+                URL_STEAM_STATUS_HISTORY,
                 json=payload,
-                label=f"ping_offer_status({offer_id})",
+                label="report_trade_history",
             )
             return True
         except CSFloatAPIError as exc:
-            log.warning("ping_offer_status(%s) failed: %s", offer_id, exc)
+            log.warning("report_trade_history failed: %s", exc)
+            return False
+
+    async def cancel_ping(self, trade_id: str | int) -> bool:
+        """
+        POST /trades/{id}/cancel-ping — confirm that no live Steam offer exists
+        for a trade the counter-party asked to cancel (``wait_for_cancel_ping``).
+        """
+        try:
+            await self._request(
+                "POST",
+                URL_TRADE_CANCEL_PING.format(trade_id=trade_id),
+                json={},
+                label=f"cancel_ping({trade_id})",
+            )
+            return True
+        except CSFloatAPIError as exc:
+            log.warning("cancel_ping(%s) failed: %s", trade_id, exc)
+            return False
+
+    async def report_rollback(self, trade_id: str | int, rollback_trade_id: str | None) -> bool:
+        """
+        POST /trades/{id}/rollback — report that the Steam trade for a CSFloat
+        trade was reversed under Steam's trade protection.
+        """
+        payload: dict[str, Any] = {"origin": REPORT_ORIGIN}
+        if rollback_trade_id:
+            payload["rollback_trade_id"] = str(rollback_trade_id)
+        try:
+            await self._request(
+                "POST",
+                URL_TRADE_ROLLBACK.format(trade_id=trade_id),
+                json=payload,
+                label=f"report_rollback({trade_id})",
+            )
+            return True
+        except CSFloatAPIError as exc:
+            log.warning("report_rollback(%s) failed: %s", trade_id, exc)
             return False
 
 

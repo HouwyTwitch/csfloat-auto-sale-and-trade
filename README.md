@@ -11,6 +11,7 @@ Async Python bot that fully automates the CS2 seller flow on [CSFloat](https://c
 | 3 | Send Steam trade offer to the buyer |
 | 4 | Confirm via Steam Guard (mobile authenticator) |
 | 5 | Notify CSFloat via steam-status API (mirrors the browser extension) |
+| 6 | Keep CSFloat in sync with Steam in the background — trade history, offer states, rollbacks, cancel pings (mirrors the CSFloat mobile app) |
 
 ## How polling works
 
@@ -24,6 +25,25 @@ CSFloat has no public WebSocket or SSE stream. The bot uses two polling tiers so
 After each processing cycle the bot waits 5 s then runs one more cycle to catch any trades that arrived during processing.
 
 Each cycle lists open sales via `/api/v1/me/trades/slim` (the lightweight listing the CSFloat extension uses), then fetches `/api/v1/trades/{id}` only for trades that still need a Steam offer. If the slim endpoint is unavailable for your API key, the bot falls back to the full `/api/v1/me/trades` listing.
+
+## Trade-state sync (how sales get verified)
+
+Every 4.5 minutes (same cadence as the CSFloat mobile app) the bot reads your
+Steam trade history and trade offers through the Steam Web API and reports
+anything CSFloat doesn't know yet:
+
+| Report | Endpoint | When |
+|--------|----------|------|
+| Trade history | `/api/v1/trades/steam-status/trade-history` | A Steam trade (Committed / Complete / Failed / rolled back) touches a pending CSFloat trade |
+| Offer state | `/api/v1/trades/steam-status/offer` | A linked offer changed state (accepted, declined, expired, …) |
+| Link offer | `/api/v1/trades/steam-status/new-offer` | An active offer gives away a pending trade's item but CSFloat hasn't linked it |
+| Rollback | `/api/v1/trades/{id}/rollback` | Steam reversed the trade under trade protection |
+| Cancel ping | `/api/v1/trades/{id}/cancel-ping` | The buyer asked to cancel and no live Steam offer exists |
+
+The Nov 2026 Steam change added the `Committed` trade status (trade done, still
+inside Steam's trade-protection window); it is included. The app's TLSNotary
+proofs are not reproduced — they need its native prover. Set
+`TRADE_STATE_INTERVAL_SECONDS=0` to turn the sync off.
 
 ## Requirements
 
@@ -121,6 +141,7 @@ cp config.example.json config.json
 | `notif_interval_seconds` | `NOTIF_INTERVAL_SECONDS` | No | Notification poll interval (default: `15`) |
 | `heartbeat_interval_seconds` | `HEARTBEAT_INTERVAL_SECONDS` | No | Heartbeat poll interval (default: `60`) |
 | `post_run_delay_seconds` | `POST_RUN_DELAY_SECONDS` | No | Delay before post-cycle re-check (default: `5`) |
+| `trade_state_interval_seconds` | `TRADE_STATE_INTERVAL_SECONDS` | No | Steam → CSFloat trade-state sync interval (default: `270`, `0` = off) |
 
 ## Usage
 
@@ -185,6 +206,7 @@ src/
     csfloat_client.py     — CSFloat REST API client (polling, accept, steam-status notify)
     steam_trader.py       — Steam client wrapper (login, inventory, send offer, confirm)
     processor.py          — trade lifecycle orchestration + fast notification polling loop
+    trade_state.py        — background Steam → CSFloat trade-state sync (mirrors the mobile app)
 requirements.txt
 config.example.json       — JSON config template
 .env.example              — environment-variable config template (used by Docker)

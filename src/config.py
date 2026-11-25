@@ -18,7 +18,8 @@ Expected JSON structure (see config.example.json for a template):
     "user_agent": "Mozilla/5.0 ...",
     "notif_interval_seconds": 15,
     "heartbeat_interval_seconds": 60,
-    "post_run_delay_seconds": 5
+    "post_run_delay_seconds": 5,
+    "trade_state_interval_seconds": 270
 }
 """
 
@@ -57,6 +58,7 @@ _ENV_MAP = {
     "NOTIF_INTERVAL_SECONDS": "notif_interval_seconds",
     "HEARTBEAT_INTERVAL_SECONDS": "heartbeat_interval_seconds",
     "POST_RUN_DELAY_SECONDS": "post_run_delay_seconds",
+    "TRADE_STATE_INTERVAL_SECONDS": "trade_state_interval_seconds",
 }
 
 
@@ -106,7 +108,12 @@ def load(path: str | Path = "config.json") -> dict:
     cfg["steam_id64"] = int(cfg["steam_id64"])
 
     # Normalise numeric tuning knobs (env vars arrive as strings)
-    for key in ("notif_interval_seconds", "heartbeat_interval_seconds", "post_run_delay_seconds"):
+    for key in (
+        "notif_interval_seconds",
+        "heartbeat_interval_seconds",
+        "post_run_delay_seconds",
+        "trade_state_interval_seconds",
+    ):
         if key in cfg and cfg[key] is not None:
             cfg[key] = float(cfg[key])
 
